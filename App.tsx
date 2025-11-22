@@ -20,8 +20,7 @@ import {
   VolumeX, 
   Sun, 
   Moon, 
-  CloudRain,
-  Github 
+  CloudRain
 } from 'lucide-react';
 import { format } from 'date-fns';
 
@@ -287,15 +286,6 @@ const App: React.FC = () => {
             >
               <Settings size={20} />
             </button>
-            <a 
-              href="https://github.com/your-repo" 
-              target="_blank" 
-              rel="noopener noreferrer"
-              className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-all text-slate-400 hover:text-white"
-              title="View Source on GitHub"
-            >
-              <Github size={20} />
-            </a>
         </div>
       </header>
 
