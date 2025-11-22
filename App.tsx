@@ -6,12 +6,12 @@ import {
   PrayerSchedule, 
   LogEntry, 
   AppState 
-} from './types';
-import { INITIAL_ZONES } from './constants';
-import { getPrayerTimes, getNextPrayer } from './services/prayerService';
-import LogsViewer from './components/LogsViewer';
-import ZoneGrid from './components/ZoneGrid';
-import InstallScriptModal from './components/InstallScriptModal';
+} from './types.ts';
+import { INITIAL_ZONES } from './constants.ts';
+import { getPrayerTimes, getNextPrayer } from './services/prayerService.ts';
+import LogsViewer from './components/LogsViewer.tsx';
+import ZoneGrid from './components/ZoneGrid.tsx';
+import InstallScriptModal from './components/InstallScriptModal.tsx';
 import { 
   Clock, 
   MapPin, 
@@ -59,8 +59,7 @@ const App: React.FC = () => {
       .then(data => {
         if (data && data.length > 0) {
           addLog('SUCCESS', `Connected to Backend. Zones: ${data.map((z:any) => z.name).join(', ')}`);
-          // Merge with initial constants or replace
-          // For now we stick to initial structure but could update available flags here
+          setZones(data);
         } else {
           addLog('WARN', 'Backend reported 0 zones, or API unavailable. Using Demo Mode.');
         }

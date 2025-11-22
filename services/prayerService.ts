@@ -1,6 +1,6 @@
 import { Coordinates, CalculationMethod, PrayerTimes, Madhab, DateComponents } from 'adhan';
-import { DUBAI_COORDS } from '../constants';
-import { PrayerName, PrayerSchedule } from '../types';
+import { DUBAI_COORDS } from '../constants.ts';
+import { PrayerName, PrayerSchedule } from '../types.ts';
 
 export const getPrayerTimes = (date: Date): PrayerSchedule[] => {
   const coords = new Coordinates(DUBAI_COORDS.latitude, DUBAI_COORDS.longitude);
