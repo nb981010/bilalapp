@@ -1,4 +1,4 @@
-import { Coordinates, CalculationMethod, PrayerTimes, Madhab, DateComponents } from 'adhan';
+import { Coordinates, CalculationMethod, PrayerTimes, Madhab } from 'adhan';
 import { DUBAI_COORDS } from '../constants.ts';
 import { PrayerName, PrayerSchedule } from '../types.ts';
 
