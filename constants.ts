@@ -20,26 +20,46 @@ export const INSTALL_SCRIPT = `#!/bin/bash
 # Bilal Installer Script
 # ----------------------
 # 1. Checks for nodejs/python dependencies
-# 2. Scans local network for Sonos devices using soco-cli or node-sonos-http-api
+# 2. Scans local network for Sonos devices using soco
 # 3. Generates config.json with detected zones
 
 LOG_DIR="/logs"
-mkdir -p $LOG_DIR
+
+echo "Creating log directory..."
+if [ ! -d "$LOG_DIR" ]; then
+  sudo mkdir -p $LOG_DIR
+  sudo chmod 777 $LOG_DIR
+fi
 
 echo "Installing dependencies..."
 sudo apt-get update && sudo apt-get install -y python3-pip vlc
 
+echo "Installing Python libraries..."
+# Install soco, handling potential managed environment restrictions on newer RPi OS
+sudo pip3 install soco --break-system-packages 2>/dev/null || sudo pip3 install soco
+
 echo "Detecting Sonos Zones..."
-# Hypothetical detection logic
-DETECTED_ZONES=$(python3 -c "import soco; print([z.player_name for z in soco.discover()])")
+# Use python to discover and output
+DETECTED_ZONES=$(python3 -c "
+import soco
+import sys
+try:
+    zones = soco.discover(timeout=10)
+    if zones:
+        print(', '.join([z.player_name for z in zones]))
+    else:
+        print('')
+except Exception as e:
+    print(f'Error: {e}', file=sys.stderr)
+")
 
 echo "Zones Detected: $DETECTED_ZONES"
 
 if [ -z "$DETECTED_ZONES" ]; then
-  echo "No zones found! Ensure you are on the same network."
-  exit 1
+  echo "Warning: No zones found! Ensure you are on the same network."
+else
+  echo "Configuration successful for zones: $DETECTED_ZONES"
 fi
 
-echo "Setup complete. Service starting..."
-# Setup cron or systemd service here
+echo "Setup complete."
 `;

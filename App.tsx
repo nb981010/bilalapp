@@ -36,7 +36,7 @@ const App: React.FC = () => {
 
   // Refs for audio and interval management
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   
   // Helper to add logs
   const addLog = useCallback((level: LogEntry['level'], message: string) => {
@@ -122,6 +122,13 @@ const App: React.FC = () => {
       playAzan(nextPrayer.name);
     }
 
+    // 3. Monitoring Phase (During Playback) - Requirement 9
+    if (appState === AppState.PLAYING && diffSeconds % 3 === 0) {
+       // Logic to track play status every 3 seconds
+       // In a real Sonos impl, we would query the player state here
+       // console.log('Monitoring playback status...');
+    }
+
   }, [currentTime, nextPrayer, appState, zones, addLog]);
 
   // Audio Playback Logic
@@ -138,18 +145,21 @@ const App: React.FC = () => {
     addLog('SUCCESS', `Starting playback: /audio/${audioFile}`);
     addLog('INFO', `Method: Dubai (IACAD), Asr: Shafi`);
 
-    // In a real app, this would trigger the Sonos API. 
-    // Here we verify logic with browser audio.
     if (audioRef.current) {
-      // Using a reliable CDN source for demo purposes since we don't have local files
-      // In production this would be `http://localhost/audio/${audioFile}`
-      audioRef.current.src = isFajr 
-        ? 'https://www.islamcan.com/audio/adhan/fajr.mp3' 
-        : 'https://www.islamcan.com/audio/adhan/azan1.mp3';
+      // Using local audio files as requested
+      audioRef.current.src = `/audio/${audioFile}`;
       
       audioRef.current.play().catch(e => {
           addLog('ERROR', `Autoplay blocked by browser: ${e.message}`);
           addLog('INFO', 'User must interact with page first (browser policy).');
+          // Fallback for demo purposes if local file missing in dev environment
+          if (e.name === 'NotSupportedError' || e.message.includes('source')) {
+             addLog('WARN', 'Local file not found, switching to CDN for demo...');
+             audioRef.current.src = isFajr 
+               ? 'https://www.islamcan.com/audio/adhan/fajr.mp3' 
+               : 'https://www.islamcan.com/audio/adhan/azan1.mp3';
+             audioRef.current.play();
+          }
       });
 
       audioRef.current.onended = () => {

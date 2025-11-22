@@ -6,7 +6,11 @@ export const getPrayerTimes = (date: Date): PrayerSchedule[] => {
   const coords = new Coordinates(DUBAI_COORDS.latitude, DUBAI_COORDS.longitude);
   
   // Dubai (IACAD) Method
-  const params = CalculationMethod.Dubai();
+  const dubaiParams = CalculationMethod.Dubai();
+  
+  // Create a mutable copy of the parameters to avoid "Attempting to change value of a readonly property"
+  // We copy the prototype and properties to ensure it passes any internal instance checks while allowing mutation
+  const params = Object.assign(Object.create(Object.getPrototypeOf(dubaiParams)), dubaiParams);
   
   // Shafi (Standard) for Asr
   params.madhab = Madhab.Shafi;
