@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# Bilal Installer Script
+# -----------------------------------
+# Run this on Raspberry Pi to setup the environment.
+
+APP_DIR=$(pwd)
+LOG_DIR="/logs"
+
+# Detect the actual user if run via sudo
+REAL_USER=${SUDO_USER:-$USER}
+
+echo "--- Starting Installation for user: $REAL_USER ---"
+
+# 0. Fix Empty Files (Manual Recovery)
+# If server.txt exists but server.py is missing or empty, copy it.
+if [ -f "$APP_DIR/server.txt" ] && [ -s "$APP_DIR/server.txt" ]; then
+    echo "Restoring server.py from server.txt..."
+    cp "$APP_DIR/server.txt" "$APP_DIR/server.py"
+fi
+
+# 1. Check for server.py
+if [ ! -f "$APP_DIR/server.py" ]; then
+  echo "ERROR: server.py not found in $APP_DIR."
+  exit 1
+fi
+
+# 2. Create Logs Directory
+echo "Configuring directories..."
+if [ ! -d "$LOG_DIR" ]; then
+  sudo mkdir -p $LOG_DIR
+  sudo chmod 777 $LOG_DIR
+  echo "Created $LOG_DIR"
+else
+  # Ensure permissions are open so the service can write
+  sudo chmod 777 $LOG_DIR
+fi
+
+# 3. Install System Dependencies
+echo "Installing system dependencies..."
+sudo apt-get update
+sudo apt-get install -y python3-pip python3-flask vlc ffmpeg
+
+# 4. Install Python Libraries
+echo "Installing Python libraries (soco, flask)..."
+# Attempt global install compatible with newer Debian (Bookworm)
+sudo pip3 install soco flask --break-system-packages 2>/dev/null || sudo pip3 install soco flask
+
+# 5. Create Systemd Service
+echo "Creating background service (bilal.service)..."
+SERVICE_FILE="/etc/systemd/system/bilal.service"
+
+sudo bash -c "cat > $SERVICE_FILE" <<EOL
+[Unit]
+Description=Bilal Azan Controller
+After=network.target
+
+[Service]
+User=$REAL_USER
+WorkingDirectory=$APP_DIR
+ExecStart=/usr/bin/python3 $APP_DIR/server.py
+Restart=always
+# Wait a bit before restarting to prevent tight loops if failing
+RestartSec=10
+StandardOutput=append:$LOG_DIR/sys.log
+StandardError=append:$LOG_DIR/sys.log
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+# 6. Enable and Start Service
+echo "Enabling and starting service..."
+sudo systemctl daemon-reload
+sudo systemctl enable bilal.service
+sudo systemctl restart bilal.service
+
+echo "--- Installation Complete ---"
+echo "App Directory: $APP_DIR"
+echo "Service User:  $REAL_USER"
+echo "App is running on port 5000."
+echo "View logs: tail -f /logs/sys.log"
