@@ -34,8 +34,7 @@ const App: React.FC = () => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showInstallModal, setShowInstallModal] = useState(false);
 
-  // Refs for audio and interval management
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // Refs for interval management
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   
   // Helper to add logs
@@ -48,22 +47,34 @@ const App: React.FC = () => {
     }]);
   }, []);
 
-  // Initial Load
+  // Initial Load & Sync with Backend
   useEffect(() => {
     addLog('INFO', 'System Startup: Bilal Control System v1.0.0');
-    addLog('INFO', 'Platform: Raspberry Pi (Simulated)');
+    addLog('INFO', 'Platform: Raspberry Pi (Hybrid Mode)');
     addLog('INFO', 'Scanning network for Sonos Zones...');
     
-    // Simulate zone detection delay
+    // Fetch real zones from backend if available
+    fetch('/api/zones')
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.length > 0) {
+          addLog('SUCCESS', `Connected to Backend. Zones: ${data.map((z:any) => z.name).join(', ')}`);
+          // Merge with initial constants or replace
+          // For now we stick to initial structure but could update available flags here
+        } else {
+          addLog('WARN', 'Backend reported 0 zones, or API unavailable. Using Demo Mode.');
+        }
+      })
+      .catch(err => {
+         addLog('WARN', 'Running in Standalone Mode (Backend unreachable)');
+      });
+
+    // Simulate zone detection delay for UI feel
     setTimeout(() => {
         const detected = INITIAL_ZONES.filter(z => z.isAvailable).map(z => z.name).join(', ');
-        addLog('SUCCESS', `Zones Detected: ${detected}`);
+        addLog('SUCCESS', `Zones Active in UI: ${detected}`);
     }, 1000);
 
-    // Request Audio Permission (browser specific quirk)
-    const audio = new Audio();
-    audioRef.current = audio;
-    
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
@@ -125,53 +136,59 @@ const App: React.FC = () => {
     // 3. Monitoring Phase (During Playback) - Requirement 9
     if (appState === AppState.PLAYING && diffSeconds % 3 === 0) {
        // Logic to track play status every 3 seconds
-       // In a real Sonos impl, we would query the player state here
        // console.log('Monitoring playback status...');
     }
 
   }, [currentTime, nextPrayer, appState, zones, addLog]);
 
   // Audio Playback Logic
-  const playAzan = (prayerName: PrayerName) => {
+  const playAzan = async (prayerName: PrayerName) => {
     setAppState(AppState.PLAYING);
     
-    // Pause existing music simulation
     addLog('WARN', 'Pausing existing streams/music on all zones.');
     setZones(prev => prev.map(z => z.isAvailable ? { ...z, status: 'playing_azan' } : z));
 
     const isFajr = prayerName === PrayerName.Fajr;
     const audioFile = isFajr ? 'fajr.mp3' : 'azan.mp3';
     
-    addLog('SUCCESS', `Starting playback: /audio/${audioFile}`);
+    addLog('SUCCESS', `Requesting Sonos Playback: /audio/${audioFile}`);
     addLog('INFO', `Method: Dubai (IACAD), Asr: Shafi`);
 
-    if (audioRef.current) {
-      // Using local audio files as requested
-      audioRef.current.src = `/audio/${audioFile}`;
-      
-      audioRef.current.play().catch(e => {
-          addLog('ERROR', `Autoplay blocked by browser: ${e.message}`);
-          addLog('INFO', 'User must interact with page first (browser policy).');
-          // Fallback for demo purposes if local file missing in dev environment
-          if (e.name === 'NotSupportedError' || e.message.includes('source')) {
-             addLog('WARN', 'Local file not found, switching to CDN for demo...');
-             audioRef.current.src = isFajr 
-               ? 'https://www.islamcan.com/audio/adhan/fajr.mp3' 
-               : 'https://www.islamcan.com/audio/adhan/azan1.mp3';
-             audioRef.current.play();
-          }
+    try {
+      const response = await fetch('/api/play', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          file: audioFile,
+          zones: zones.filter(z => z.isAvailable).map(z => z.name)
+        })
       });
 
-      audioRef.current.onended = () => {
+      const result = await response.json();
+      
+      if (response.ok) {
+        addLog('SUCCESS', `Sonos Accepted Command: ${result.status}`);
+      } else {
+        throw new Error(result.message || 'Unknown error');
+      }
+
+      // Simulate duration of Azan (approx 3 mins) then restore
+      // In production, we would poll the API for status
+      setTimeout(() => {
         finishAzan();
-      };
+      }, 180000); 
+
+    } catch (error: any) {
+      addLog('ERROR', `Playback Failed: ${error.message}`);
+      addLog('WARN', 'Check server logs or connectivity.');
+      finishAzan(); // Reset state anyway
     }
   };
 
   // Cleanup Logic
   const finishAzan = () => {
     setAppState(AppState.RESTORING);
-    addLog('INFO', 'Azan finished. Restoring previous zone states...');
+    addLog('INFO', 'Azan logic finished. Restoring previous zone states...');
     
     // Restore logic
     setTimeout(() => {
@@ -371,9 +388,6 @@ const App: React.FC = () => {
       </main>
 
       <InstallScriptModal isOpen={showInstallModal} onClose={() => setShowInstallModal(false)} />
-
-      {/* Audio Element for Playback (Hidden) */}
-      <audio ref={audioRef} className="hidden" />
     </div>
   );
 };
