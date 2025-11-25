@@ -32,6 +32,7 @@ app = Flask(__name__, static_folder='.')
 SONOS_SNAPSHOT = {}  # Store zone snapshots: {uid: {volume, uri, position}}
 PLAYBACK_ACTIVE = False
 AZAN_LOCK = False  # Prevent music/radio playback during Azan
+AZAN_STARTED = False  # True when initial Azan start succeeded (prevents retries)
 STATIC_ZONE_NAMES = [
     "Pool",
     "Boy 1",
@@ -238,9 +239,35 @@ def play_audio():
 
         try:
             coordinator.play_uri(audio_url, meta=meta)
+            # Give the speaker a short moment to accept the URI and update state
+            time.sleep(1)
+            # Verify the coordinator actually loaded/started the Azan URI
+            try:
+                post_track = coordinator.get_current_track_info()
+                post_transport = coordinator.get_current_transport_info()
+                post_uri = post_track.get('uri') or ''
+                post_state = post_transport.get('current_transport_state')
+                logger.info(f"Post-play check: uri={post_uri}, state={post_state}")
+                # Consider start successful only if the coordinator reports the Azan URI or is PLAYING
+                if (audio_url in post_uri) or (post_state == 'PLAYING'):
+                    AZAN_STARTED = True
+                    logger.info("Azan start confirmed on coordinator")
+                else:
+                    # Treat as failure: do not retry later
+                    logger.error("Coordinator did not start Azan (URI/state mismatch). Aborting single attempt.")
+                    AZAN_LOCK = False
+                    AZAN_STARTED = False
+                    return jsonify({"status": "error", "message": "Azan playback failed to start."}), 500
+            except Exception as e:
+                logger.error(f"Post-play verification failed: {e}")
+                AZAN_LOCK = False
+                AZAN_STARTED = False
+                return jsonify({"status": "error", "message": "Azan playback verification failed."}), 500
         except Exception as e:
             logger.error(f"Azan playback failed: {e}")
+            # Clear lock and do NOT retry — caller wanted single-attempt semantics
             AZAN_LOCK = False
+            AZAN_STARTED = False
             return jsonify({"status": "error", "message": "Azan playback failed."}), 500
 
         # Start Monitoring Thread
@@ -264,6 +291,7 @@ def monitor_playback(coordinator, speakers, audio_url):
     start_time = time.time()
     duration = 180  # 3 minutes
     last_azan_position = None
+    resume_attempted = False
     while time.time() - start_time < duration:
         try:
             info = coordinator.get_current_transport_info()
@@ -293,35 +321,46 @@ def monitor_playback(coordinator, speakers, audio_url):
                         logger.info(f"Azan position {pos_str} >= {azan_duration_seconds}s, Azan finished")
                         break
             elif current_uri != audio_url:
-                logger.info(f"Azan interrupted by another track (URI: {current_uri}). Enforcing Azan priority - resuming Azan from position {last_azan_position}.")
-                # Force resume Azan
-                coordinator.stop()
-                time.sleep(1)
-                title = "Azan by Bilal App"
-                meta = f"""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
+                # Only attempt a single controlled resume if the Azan actually started previously
+                logger.info(f"Detected non-Azan URI: {current_uri}. last_azan_position={last_azan_position}, AZAN_STARTED={AZAN_STARTED}, resume_attempted={resume_attempted}")
+                if not AZAN_STARTED:
+                    logger.info("Azan was never started successfully; skipping restart attempt.")
+                elif resume_attempted:
+                    logger.info("Resume already attempted once; skipping further resume attempts.")
+                elif not last_azan_position or last_azan_position == '0:00:00':
+                    logger.info("No valid last Azan position available; skipping resume to avoid restarting from beginning.")
+                else:
+                    logger.info(f"Attempting single resume of Azan from position {last_azan_position}.")
+                    resume_attempted = True
+                    try:
+                        # Force resume Azan once from last known position
+                        coordinator.stop()
+                        time.sleep(1)
+                        title = "Azan by Bilal App"
+                        meta = f"""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
 <item id="0" parentID="0" restricted="0">
 <dc:title>{title}</dc:title>
 <upnp:class>object.item.audioItem</upnp:class>
 <res protocolInfo="http-get:*:audio/mpeg:*">{audio_url}</res>
 </item>
 </DIDL-Lite>"""
-                coordinator.play_uri(audio_url, meta=meta)
-                coordinator.play()
-                # Seek to the last Azan position
-                if last_azan_position:
-                    time.sleep(1)  # Wait for play to start
-                    try:
-                        coordinator.seek(last_azan_position)
-                        logger.info(f"Seeked to {last_azan_position}")
-                    except Exception as e:
-                        logger.warning(f"Seek failed: {e}")
-                # Re-group if needed
-                for s in speakers:
-                    if s != coordinator and not s.is_coordinator:
+                        coordinator.play_uri(audio_url, meta=meta)
+                        # Wait briefly and attempt to seek to last position; if seek fails, do NOT retry
+                        time.sleep(1)
                         try:
-                            s.join(coordinator)
+                            coordinator.seek(last_azan_position)
+                            logger.info(f"Seeked to {last_azan_position}")
                         except Exception as e:
-                            logger.warning(f"Re-group failed for {s.player_name}: {e}")
+                            logger.warning(f"Seek failed during single-resume attempt: {e}. Will not retry to avoid restarting from beginning.")
+                        # Re-group if needed (best-effort)
+                        for s in speakers:
+                            if s != coordinator and not s.is_coordinator:
+                                try:
+                                    s.join(coordinator)
+                                except Exception as e:
+                                    logger.warning(f"Re-group failed for {s.player_name}: {e}")
+                    except Exception as e:
+                        logger.error(f"Single resume attempt failed: {e}. Skipping further resume attempts.")
             time.sleep(3)
         except Exception as e:
             logger.error(f"Monitor Error: {e}")
