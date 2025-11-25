@@ -34,8 +34,20 @@ const App: React.FC = () => {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showInstallModal, setShowInstallModal] = useState(false);
 
+  const [triggeredPrayers, setTriggeredPrayers] = useState<Set<string>>(new Set());
+
   // Refs for interval management
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Fetch schedule on mount
+  useEffect(() => {
+    const fetchSchedule = async () => {
+      const dailySchedule = await getPrayerTimes(new Date());
+      setSchedule(dailySchedule);
+      setNextPrayer(getNextPrayer(dailySchedule));
+    };
+    fetchSchedule();
+  }, []);
   
   // Helper to add logs
   const addLog = useCallback((level: LogEntry['level'], message: string) => {
@@ -52,55 +64,28 @@ const App: React.FC = () => {
     addLog('INFO', 'System Startup: Bilal Control System v1.0.0');
     addLog('INFO', 'Platform: Raspberry Pi (Hybrid Mode)');
     addLog('INFO', 'Scanning network for Sonos Zones...');
-    
-    // Fetch real zones from backend if available
+
     fetch('/api/zones')
       .then(res => res.json())
       .then(data => {
-        if (data && data.length > 0) {
+        if (Array.isArray(data) && data.length > 0) {
           addLog('SUCCESS', `Connected to Backend. Zones: ${data.map((z:any) => z.name).join(', ')}`);
           setZones(data);
         } else {
           addLog('WARN', 'Backend reported 0 zones, or API unavailable. Using Demo Mode.');
+          setZones(INITIAL_ZONES);
         }
       })
       .catch(err => {
-         addLog('WARN', 'Running in Standalone Mode (Backend unreachable)');
+        addLog('ERROR', 'Backend unreachable, using Demo Mode.');
+        setZones(INITIAL_ZONES);
       });
-
-    // Simulate zone detection delay for UI feel
-    setTimeout(() => {
-        const detected = INITIAL_ZONES.filter(z => z.isAvailable).map(z => z.name).join(', ');
-        addLog('SUCCESS', `Zones Active in UI: ${detected}`);
-    }, 1000);
 
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // Time Tick & Prayer Calculation
-  useEffect(() => {
-    const tick = () => {
-      const now = new Date();
-      setCurrentTime(now);
-
-      // Update schedule every minute or on load
-      if (now.getSeconds() === 0 || schedule.length === 0) {
-        const dailySchedule = getPrayerTimes(now);
-        setSchedule(dailySchedule);
-        setNextPrayer(getNextPrayer(dailySchedule));
-      }
-    };
-
-    tick(); // initial tick
-    intervalRef.current = setInterval(tick, 1000);
-
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [schedule.length]);
 
   // Main Logic Loop (Triggered every second by currentTime change)
   useEffect(() => {
@@ -160,6 +145,17 @@ const App: React.FC = () => {
     addLog('INFO', `Method: Dubai (IACAD), Asr: Shafi`);
 
     try {
+      // First, prepare zones
+      addLog('INFO', 'Preparing zones for Azan');
+      const prepareRes = await fetch('/api/prepare');
+      if (!prepareRes.ok) {
+        addLog('ERROR', 'Zone preparation failed');
+        setAppState(AppState.IDLE);
+        return;
+      }
+      addLog('SUCCESS', 'Zones prepared and grouped');
+
+      // Then play
       const response = await fetch('/api/play', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -190,6 +186,28 @@ const App: React.FC = () => {
     }
   };
 
+  // Time Tick & Prayer Calculation
+  useEffect(() => {
+    const tick = async () => {
+      const now = new Date();
+      setCurrentTime(now);
+
+      // Update schedule every minute
+      if (now.getSeconds() === 0) {
+        const dailySchedule = await getPrayerTimes(now);
+        setSchedule(dailySchedule);
+        setNextPrayer(getNextPrayer(dailySchedule));
+      }
+    };
+
+    tick(); // initial tick
+    intervalRef.current = setInterval(tick, 60000); // every minute
+
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+    };
+  }, []);
+
   // Cleanup Logic
   const finishAzan = () => {
     setAppState(AppState.RESTORING);
@@ -218,7 +236,7 @@ const App: React.FC = () => {
     
     // Fast forward logic for test
     setTimeout(() => {
-        playAzan(PrayerName.Dhuhr);
+        playAzan(PrayerName.Fajr);
     }, 2000);
   };
 
