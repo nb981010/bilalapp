@@ -175,9 +175,18 @@ def play_audio():
         logger.warning("Azan already in progress, blocking duplicate playback.")
         return jsonify({"status": "error", "message": "Azan in progress, playback blocked."}), 429
     data = request.json
-    filename = data.get('file', 'fajr.mp3')
-    
-    logger.info(f"Received Play Request: {filename}")
+    # Incoming requests may specify prayer-specific filenames (e.g. dhuhr.mp3).
+    # The deployment only contains two files:
+    # - `fajr.mp3` for Fajr
+    # - `azan.mp3` for all other Azan times
+    requested = (data.get('file') or 'fajr.mp3').strip()
+    # Normalize and map to available files
+    if 'fajr' in requested.lower():
+        filename = 'fajr.mp3'
+    else:
+        filename = 'azan.mp3'
+
+    logger.info(f"Received Play Request: {requested} -> mapped to: {filename}")
 
     try:
         speakers = get_sonos_speakers()
