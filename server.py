@@ -397,17 +397,30 @@ def monitor_playback(coordinator, speakers, audio_url):
                     logger.warning(f"Ungroup failed for {s.player_name}: {e}")
             # Resume previous music/radio if was playing
             if snap["state"] == "PLAYING" and snap["uri"]:
-                if 'sid=' in snap["uri"]:
-                    logger.info(f"Skipping resume for streaming URI: {snap['uri']} for {s.player_name}")
-                else:
-                    logger.info(f"Attempting to resume {snap['uri']} at {snap['position']} for {s.player_name}")
+                # Determine whether the snapped URI is a local audio file served by this app
+                # or an external/streaming URI (radio). For streaming URIs we should not
+                # attempt to seek back to a saved position because live streams either
+                # don't support seeking or seeking would restart the stream.
+                uri = snap["uri"] or ''
+                is_stream = ('sid=' in uri) or ('/audio/' not in uri)
+                if is_stream:
+                    logger.info(f"Skipping seek/position restore for streaming URI: {uri} for {s.player_name}")
                     try:
-                        s.play_uri(snap["uri"])
+                        # Best-effort: restore the URI so the speaker returns to the same stream
+                        s.play_uri(uri)
+                        logger.info(f"Restored streaming URI for {s.player_name}: {uri}")
+                    except Exception as e:
+                        logger.warning(f"Restore streaming URI failed for {s.player_name}: {e}")
+                else:
+                    logger.info(f"Attempting to resume {uri} at {snap['position']} for {s.player_name}")
+                    try:
+                        s.play_uri(uri)
+                        # Only attempt to seek for local/audio files where stored positions make sense
                         if snap["position"] and snap["position"] != 'NOT_IMPLEMENTED':
                             time.sleep(1)
                             s.seek(snap["position"])
                             logger.info(f"Seeked to {snap['position']} for {s.player_name}")
-                        logger.info(f"Resumed playback for {s.player_name}: {snap['uri']} at {snap['position']}")
+                        logger.info(f"Resumed playback for {s.player_name}: {uri} at {snap['position']}")
                     except Exception as e:
                         logger.warning(f"Restore playback failed for {s.player_name}: {e}")
             else:
