@@ -74,6 +74,10 @@ else
   npm install --silent
   npm run build --silent || echo "Frontend build ultimately failed"
 fi
+# Ensure built assets are owned by the app user
+if [ -d "$APP_DIR/dist" ]; then
+  chown -R $REAL_USER:$REAL_USER "$APP_DIR/dist" || true
+fi
 
 # 0. Fix Empty Files (Manual Recovery)
 # If server.txt exists but server.py is missing or empty, copy it.
@@ -143,6 +147,9 @@ WorkingDirectory=$APP_DIR
 ExecStart=/usr/bin/node $APP_DIR/server-static.cjs
 Restart=always
 RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bilal-feapp
 
 [Install]
 WantedBy=multi-user.target
