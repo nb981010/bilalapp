@@ -196,7 +196,6 @@ def schedule_prayers_for_date(target_date: date):
     installed in the runtime environment (the installer already includes them).
     If those libraries are missing, we log a warning and skip scheduling.
     """
-    global scheduler
     if not SCHEDULER_AVAILABLE:
         logger.warning("Scheduler or prayer-time libraries not available; skipping scheduling")
         return
@@ -208,7 +207,10 @@ def schedule_prayers_for_date(target_date: date):
         tz = get_localzone()
         pt = praytimes.PrayTimes()
         # praytimes expects a (year, month, day) tuple
-        times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz=0)
+        # praytimes expects a positional timezone argument (numeric offset), not the
+        # keyword 'tz' in some package versions; pass 0 as the timezone offset
+        # (this function uses local system tz for datetime objects below).
+        times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), 0)
         # The library returns HH:MM strings for keys like 'fajr', 'dhuhr', 'asr', 'maghrib', 'isha'
         prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
         for key in prayer_keys:
@@ -240,7 +242,6 @@ def schedule_prayers_for_date(target_date: date):
 
 def schedule_today_and_rescheduler():
     """Schedule today's prayers and a daily rescheduler at 00:05 local time."""
-    global scheduler
     if not SCHEDULER_AVAILABLE:
         return
     tz = get_localzone()
@@ -251,8 +252,9 @@ def schedule_today_and_rescheduler():
     try:
         # compute next midnight + 5 minutes
         tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time()) + timedelta(minutes=5)
-        # localize
-        tomorrow = tz.localize(tomorrow)
+        # tz may be a zoneinfo.ZoneInfo which doesn't provide `localize`.
+        # Use tz-aware datetime via replace(tzinfo=tz).
+        tomorrow = tomorrow.replace(tzinfo=tz)
         def _resched():
             schedule_prayers_for_date(date.today())
         if 'rescheduler-daily' not in [j.id for j in scheduler.get_jobs()]:
@@ -572,7 +574,6 @@ def monitor_playback(coordinator, speakers, audio_url):
 if __name__ == '__main__':
     logger.info("Server Starting on Port 5000...")
     # Initialize and start scheduler if available
-    global scheduler
     if SCHEDULER_AVAILABLE:
         try:
             scheduler = BackgroundScheduler()
