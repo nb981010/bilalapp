@@ -286,17 +286,46 @@ def schedule_prayers_for_date(target_date: date):
         lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
         lon = float(os.environ.get('PRAYER_LON', '55.2708'))
         tz = get_localzone()
-        pt = praytimes.PrayTimes()
-        # praytimes expects a (year, month, day) tuple and a timezone offset in hours.
-        # Compute the local timezone offset for the target date (may include DST)
+        # Prefer computing times with the frontend `adhan` implementation via our Node helper
+        times = None
         try:
-            local_dt = datetime(target_date.year, target_date.month, target_date.day, tzinfo=tz)
-            offset_td = local_dt.utcoffset() or timedelta(0)
-            tz_offset_hours = offset_td.total_seconds() / 3600.0
-        except Exception:
-            tz_offset_hours = 0
-        # Pass the computed offset so returned times are in local time
-        times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz_offset_hours)
+            script = os.path.join(os.path.dirname(__file__), 'scripts', 'compute_prayer_times.mjs')
+            if os.path.exists(script):
+                cmd = ['node', script, target_date.isoformat()]
+                p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True)
+                out, err = p.communicate(timeout=5)
+                if p.returncode == 0 and out:
+                    try:
+                        node_data = json.loads(out)
+                        # node_data contains times as HH:MM strings; convert to same structure as praytimes.getTimes
+                        times = {
+                            'fajr': node_data.get('fajr'),
+                            'sunrise': node_data.get('sunrise'),
+                            'dhuhr': node_data.get('dhuhr'),
+                            'asr': node_data.get('asr'),
+                            'maghrib': node_data.get('maghrib'),
+                            'isha': node_data.get('isha')
+                        }
+                    except Exception:
+                        logger.warning(f"Node helper returned invalid JSON for prayertimes: {out}")
+                else:
+                    logger.warning(f"Node helper failed for prayertimes: rc={p.returncode} err={err}")
+        except Exception as e:
+            logger.warning(f"Failed to run node helper for prayer schedule: {e}")
+
+        # Fallback to Python praytimes if node helper did not produce times
+        if times is None:
+            pt = praytimes.PrayTimes()
+            # praytimes expects a (year, month, day) tuple and a timezone offset in hours.
+            # Compute the local timezone offset for the target date (may include DST)
+            try:
+                local_dt = datetime(target_date.year, target_date.month, target_date.day, tzinfo=tz)
+                offset_td = local_dt.utcoffset() or timedelta(0)
+                tz_offset_hours = offset_td.total_seconds() / 3600.0
+            except Exception:
+                tz_offset_hours = 0
+            # Pass the computed offset so returned times are in local time
+            times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz_offset_hours)
         prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
         # Load recent play history to avoid treating test runs (far from scheduled time) as on-time plays.
         play_history = []
