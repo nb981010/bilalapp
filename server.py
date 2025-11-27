@@ -5,7 +5,18 @@ import logging
 import socket
 import json
 import subprocess
+from datetime import datetime, date, timedelta
 from flask import Flask, send_from_directory, jsonify, request
+
+# Optional scheduler/prayer time imports (installed by install.sh)
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.date import DateTrigger
+    import praytimes
+    from tzlocal import get_localzone
+    SCHEDULER_AVAILABLE = True
+except Exception:
+    SCHEDULER_AVAILABLE = False
 
 # Configure Logging
 logging.basicConfig(
@@ -18,13 +29,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger("BilalServer")
 
-# Kill any existing process on port 5000
-try:
-    result = subprocess.run(['fuser', '-k', '5000/tcp'], check=False, capture_output=True)
-    if result.returncode == 0:
-        logger.info("Killed any existing process on port 5000")
-except Exception as e:
-    logger.warning(f"Failed to kill process on port 5000: {e}")
+# Safely handle any stale process on port 5000, but only once per host boot/service install.
+# Create a lightweight marker file in /tmp to avoid repeated kills during rapid restarts.
+PORT_CHECK_MARKER = '/tmp/bilalv3_port_check_done'
+if not os.path.exists(PORT_CHECK_MARKER):
+    try:
+        # Use `ss` to inspect listening processes on port 5000 (may require sudo to show all details).
+        ss = subprocess.run(['ss', '-ltnp', 'sport = :5000'], check=False, capture_output=True, text=True)
+        ss_out = (ss.stdout or '') + (ss.stderr or '')
+        if not ss_out.strip():
+            logger.info("Port 5000 appears free")
+        else:
+            curpid = str(os.getpid())
+            # If current process is already using the port, do nothing.
+            if curpid in ss_out:
+                logger.info(f"Port 5000 is in use by current process (pid {curpid}); not killing")
+            # If output references obvious bilal identifiers, avoid killing.
+            elif 'server.py' in ss_out or 'bilal-beapp' in ss_out:
+                logger.info("Port 5000 is in use by a bilal process; not killing")
+            else:
+                logger.info("Port 5000 is in use by another process; killing stale process(es)")
+                try:
+                    subprocess.run(['fuser', '-k', '5000/tcp'], check=False)
+                    logger.info("Killed stale process(es) on port 5000")
+                except Exception as e:
+                    logger.warning(f"Failed to kill stale process on port 5000: {e}")
+        # Write marker so this check won't run again until marker is removed
+        try:
+            with open(PORT_CHECK_MARKER, 'w') as f:
+                f.write(f"checked_by_pid:{os.getpid()}\n")
+        except Exception as e:
+            logger.warning(f"Failed to write port check marker: {e}")
+    except Exception as e:
+        logger.warning(f"Failed to inspect/handle port 5000: {e}")
+else:
+    logger.info("Port check already completed previously; skipping port-kill logic")
 
 app = Flask(__name__, static_folder='.')
 
@@ -38,7 +77,7 @@ STATIC_ZONE_NAMES = [
     "Boy 1",
     "Boy 2",
     "Girls Room",
-    "Living Room Sonos",
+    "Living Room",
     "Master Bedroom"
 ]
 
@@ -130,6 +169,108 @@ def list_zones():
     except Exception as e:
         logger.error(f"API /api/zones error: {e}")
         return jsonify([]), 500
+
+
+# ---------------------------------------------------------
+# Scheduler helpers (optional)
+# ---------------------------------------------------------
+scheduler = None
+
+def _http_post_play(filename):
+    """POST to the local /api/play endpoint to trigger playback."""
+    try:
+        import urllib.request
+        body = json.dumps({"file": filename}).encode('utf-8')
+        req = urllib.request.Request('http://127.0.0.1:5000/api/play', data=body, headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp_body = resp.read().decode('utf-8')
+            logger.info(f"Scheduled play triggered for {filename}: {resp.status} {resp_body}")
+    except Exception as e:
+        logger.error(f"Scheduled play POST failed for {filename}: {e}")
+
+
+def schedule_prayers_for_date(target_date: date):
+    """Compute prayer times for `target_date` and schedule Azan jobs.
+
+    This function is best-effort: it requires `praytimes` and `tzlocal` to be
+    installed in the runtime environment (the installer already includes them).
+    If those libraries are missing, we log a warning and skip scheduling.
+    """
+    global scheduler
+    if not SCHEDULER_AVAILABLE:
+        logger.warning("Scheduler or prayer-time libraries not available; skipping scheduling")
+        return
+
+    try:
+        # Get coordinates from environment variables if provided, else default to Dubai
+        lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
+        lon = float(os.environ.get('PRAYER_LON', '55.2708'))
+        tz = get_localzone()
+        pt = praytimes.PrayTimes()
+        # praytimes expects a (year, month, day) tuple
+        times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz=0)
+        # The library returns HH:MM strings for keys like 'fajr', 'dhuhr', 'asr', 'maghrib', 'isha'
+        prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
+        for key in prayer_keys:
+            tstr = times.get(key)
+            if not tstr:
+                continue
+            # Parse HH:MM (some outputs may include seconds 'HH:MM:SS')
+            parts = tstr.split(':')
+            hour = int(parts[0])
+            minute = int(parts[1])
+            scheduled_dt = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
+            now = datetime.now(tz)
+            if scheduled_dt <= now:
+                logger.debug(f"Skipping past prayer {key} at {scheduled_dt}")
+                continue
+            job_id = f"azan-{target_date.isoformat()}-{key}"
+            # Avoid duplicate jobs
+            existing = [j.id for j in scheduler.get_jobs()]
+            if job_id in existing:
+                logger.info(f"Job {job_id} already scheduled; skipping")
+                continue
+            logger.info(f"Scheduling {key} Azan at {scheduled_dt.isoformat()} (job id: {job_id})")
+            # Schedule a simple HTTP POST to /api/play with appropriate filename
+            filename = 'fajr.mp3' if key == 'fajr' else 'azan.mp3'
+            scheduler.add_job(_http_post_play, trigger=DateTrigger(run_date=scheduled_dt), args=[filename], id=job_id)
+    except Exception as e:
+        logger.error(f"Failed to schedule prayers for {target_date}: {e}")
+
+
+def schedule_today_and_rescheduler():
+    """Schedule today's prayers and a daily rescheduler at 00:05 local time."""
+    global scheduler
+    if not SCHEDULER_AVAILABLE:
+        return
+    tz = get_localzone()
+    today = date.today()
+    schedule_prayers_for_date(today)
+
+    # Add a daily job at 00:05 to schedule the next day
+    try:
+        # compute next midnight + 5 minutes
+        tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time()) + timedelta(minutes=5)
+        # localize
+        tomorrow = tz.localize(tomorrow)
+        def _resched():
+            schedule_prayers_for_date(date.today())
+        if 'rescheduler-daily' not in [j.id for j in scheduler.get_jobs()]:
+            scheduler.add_job(_resched, trigger=DateTrigger(run_date=tomorrow), id='rescheduler-daily')
+            logger.info(f"Scheduled daily rescheduler at {tomorrow}")
+    except Exception as e:
+        logger.warning(f"Failed to schedule daily rescheduler: {e}")
+
+
+@app.route('/api/scheduler/jobs', methods=['GET'])
+def list_scheduled_jobs():
+    """Return a list of scheduled jobs (if scheduler is available)."""
+    if not SCHEDULER_AVAILABLE or not scheduler:
+        return jsonify({'available': False, 'jobs': []})
+    jobs = []
+    for j in scheduler.get_jobs():
+        jobs.append({'id': j.id, 'next_run_time': str(j.next_run_time)})
+    return jsonify({'available': True, 'jobs': jobs})
 
 @app.route('/api/prepare', methods=['GET'])
 def prepare_group():
@@ -230,8 +371,7 @@ def play_audio():
             AZAN_LOCK = False
             return jsonify({"status": "error", "message": "Failed to snapshot all speakers."}), 500
 
-        # Pick coordinator (first speaker)
-        coordinator = speakers[0]
+        # Use the elected coordinator determined earlier (do not overwrite)
         local_ip = get_local_ip()
         audio_url = f"http://{local_ip}:5000/audio/{filename}"
         logger.info(f"Playing URL: {audio_url} on {coordinator.player_name}")
@@ -431,4 +571,19 @@ def monitor_playback(coordinator, speakers, audio_url):
 
 if __name__ == '__main__':
     logger.info("Server Starting on Port 5000...")
+    # Initialize and start scheduler if available
+    global scheduler
+    if SCHEDULER_AVAILABLE:
+        try:
+            scheduler = BackgroundScheduler()
+            scheduler.start()
+            logger.info("BackgroundScheduler started")
+            # Schedule today's prayers and a daily rescheduler job
+            schedule_today_and_rescheduler()
+            logger.info(f"Scheduled jobs: {[j.id for j in scheduler.get_jobs()]}")
+        except Exception as e:
+            logger.error(f"Failed to start scheduler: {e}")
+    else:
+        logger.info("Scheduler not available in this environment; automatic scheduling disabled")
+
     app.run(host='0.0.0.0', port=5000)

@@ -1,0 +1,8 @@
+flask
+soco
+praytimes
+schedule
+python-dotenv
+gunicorn
+apscheduler
+tzlocal
