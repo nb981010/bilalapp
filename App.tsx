@@ -38,6 +38,7 @@ const App: React.FC = () => {
 
   // Refs for interval management
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const triggeredPrayersRef = useRef(new Set<string>());
 
   // Fetch schedule on mount
   useEffect(() => {

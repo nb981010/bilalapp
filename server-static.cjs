@@ -32,10 +32,38 @@ function sendFile(res, filePath) {
   });
 }
 
+const httpProxy = require('http');
+
+function proxyToBackend(req, res) {
+  const backendOpts = {
+    hostname: '127.0.0.1',
+    port: 5000,
+    path: req.url,
+    method: req.method,
+    headers: req.headers,
+  };
+  const pres = httpProxy.request(backendOpts, (presp) => {
+    // copy status and headers
+    const headers = presp.headers;
+    res.writeHead(presp.statusCode || 200, headers);
+    presp.pipe(res);
+  });
+  pres.on('error', (err) => {
+    res.writeHead(502, { 'Content-Type': 'text/plain' });
+    res.end('Bad Gateway');
+  });
+  // pipe request body
+  req.pipe(pres);
+}
+
 const server = http.createServer((req, res) => {
   try {
     const parsed = url.parse(req.url || '/');
     let pathname = decodeURIComponent(parsed.pathname || '/');
+    // Proxy API and audio requests to backend
+    if (pathname.startsWith('/api') || pathname.startsWith('/audio')) {
+      return proxyToBackend(req, res);
+    }
     if (pathname === '/') pathname = '/index.html';
     const safePath = path.normalize(path.join(DIST, pathname));
     if (!safePath.startsWith(DIST)) {
