@@ -25,3 +25,13 @@ View your app in AI Studio: https://ai.studio/apps/drive/1h2MqFMXz1PFufOfwJTaOQW
 - If you need to force a playback (for debugging or manual override), use the existing force mechanism/endpoints which can resume or force-play Azan until completion.
 
 This prevents repeated, in‑vain restarts if the speaker fails to accept the Azan URI. See `server.py` for implementation details.
+
+## Diagnostics & Debugging Endpoints
+
+The backend exposes a few helpful endpoints for diagnosing scheduler state and testing:
+
+- `GET /api/scheduler/jobs` : lists scheduled jobs (IDs and next run times).
+- `POST /api/scheduler/force-schedule` : forces a rescan and scheduling run for today.
+- `POST /api/scheduler/simulate-play` : append a simulated play-history event for testing scheduling logic. JSON body example: `{"file":"azan.mp3","ts":"2025-11-27T18:31:00+04:00"}`.
+
+Use `journalctl -u bilal-beapp.service -f` to follow Gunicorn/server logs (they are sent to journald).
