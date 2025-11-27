@@ -12,6 +12,7 @@ from flask import Flask, send_from_directory, jsonify, request
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.date import DateTrigger
+    from apscheduler.triggers.interval import IntervalTrigger
     import praytimes
     from tzlocal import get_localzone
     SCHEDULER_AVAILABLE = True
@@ -192,54 +193,48 @@ def _http_post_play(filename):
 def schedule_prayers_for_date(target_date: date):
     """Compute prayer times for `target_date` and schedule Azan jobs.
 
-    This function is best-effort: it requires `praytimes` and `tzlocal` to be
-    installed in the runtime environment (the installer already includes them).
-    If those libraries are missing, we log a warning and skip scheduling.
+    Returns the number of Azan jobs successfully scheduled (0 if none).
     """
+    global scheduler
     if not SCHEDULER_AVAILABLE:
         logger.warning("Scheduler or prayer-time libraries not available; skipping scheduling")
-        return
+        return 0
 
+    scheduled_count = 0
     try:
         # Get coordinates from environment variables if provided, else default to Dubai
         lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
         lon = float(os.environ.get('PRAYER_LON', '55.2708'))
         tz = get_localzone()
         pt = praytimes.PrayTimes()
-        # praytimes expects a (year, month, day) tuple
-        # praytimes expects a positional timezone argument (numeric offset), not the
-        # keyword 'tz' in some package versions; pass 0 as the timezone offset
-        # (this function uses local system tz for datetime objects below).
+        # praytimes expects a (year, month, day) tuple; pass 0 as timezone offset
         times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), 0)
-        # The library returns HH:MM strings for keys like 'fajr', 'dhuhr', 'asr', 'maghrib', 'isha'
         prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
         for key in prayer_keys:
             tstr = times.get(key)
             if not tstr:
                 continue
-            # Parse HH:MM (some outputs may include seconds 'HH:MM:SS')
             parts = tstr.split(':')
             hour = int(parts[0])
             minute = int(parts[1])
+            # Create timezone-aware datetime using zoneinfo-compatible tz
             scheduled_dt = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
             now = datetime.now(tz)
             if scheduled_dt <= now:
                 logger.debug(f"Skipping past prayer {key} at {scheduled_dt}")
                 continue
             job_id = f"azan-{target_date.isoformat()}-{key}"
-            # Avoid duplicate jobs
             existing = [j.id for j in scheduler.get_jobs()]
             if job_id in existing:
                 logger.info(f"Job {job_id} already scheduled; skipping")
                 continue
             logger.info(f"Scheduling {key} Azan at {scheduled_dt.isoformat()} (job id: {job_id})")
-            # Schedule a simple HTTP POST to /api/play with appropriate filename
             filename = 'fajr.mp3' if key == 'fajr' else 'azan.mp3'
             scheduler.add_job(_http_post_play, trigger=DateTrigger(run_date=scheduled_dt), args=[filename], id=job_id)
+            scheduled_count += 1
     except Exception as e:
         logger.error(f"Failed to schedule prayers for {target_date}: {e}")
-
-
+    return scheduled_count
 def schedule_today_and_rescheduler():
     """Schedule today's prayers and a daily rescheduler at 00:05 local time."""
     if not SCHEDULER_AVAILABLE:
