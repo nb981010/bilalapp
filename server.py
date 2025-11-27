@@ -241,22 +241,49 @@ def schedule_today_and_rescheduler():
         return
     tz = get_localzone()
     today = date.today()
-    schedule_prayers_for_date(today)
 
-    # Add a daily job at 00:05 to schedule the next day
-    try:
-        # compute next midnight + 5 minutes
-        tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time()) + timedelta(minutes=5)
-        # tz may be a zoneinfo.ZoneInfo which doesn't provide `localize`.
-        # Use tz-aware datetime via replace(tzinfo=tz).
-        tomorrow = tomorrow.replace(tzinfo=tz)
-        def _resched():
-            schedule_prayers_for_date(date.today())
-        if 'rescheduler-daily' not in [j.id for j in scheduler.get_jobs()]:
-            scheduler.add_job(_resched, trigger=DateTrigger(run_date=tomorrow), id='rescheduler-daily')
-            logger.info(f"Scheduled daily rescheduler at {tomorrow}")
-    except Exception as e:
-        logger.warning(f"Failed to schedule daily rescheduler: {e}")
+    # Attempt to schedule today's prayers and record how many jobs were added.
+    added = schedule_prayers_for_date(today)
+
+    # Helper to schedule the daily rescheduler (next day at 00:05)
+    def _schedule_daily_rescheduler():
+        try:
+            tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time()) + timedelta(minutes=5)
+            tomorrow = tomorrow.replace(tzinfo=tz)
+            def _resched():
+                schedule_prayers_for_date(date.today())
+            if 'rescheduler-daily' not in [j.id for j in scheduler.get_jobs()]:
+                scheduler.add_job(_resched, trigger=DateTrigger(run_date=tomorrow), id='rescheduler-daily')
+                logger.info(f"Scheduled daily rescheduler at {tomorrow}")
+        except Exception as e:
+            logger.warning(f"Failed to schedule daily rescheduler: {e}")
+
+    # If nothing was scheduled for today (device may have been down at midnight),
+    # add an hourly retry job that will attempt to schedule today's prayers until successful.
+    if added == 0:
+        try:
+            def _try_schedule_missed():
+                try:
+                    cnt = schedule_prayers_for_date(date.today())
+                    if cnt > 0:
+                        logger.info(f"Missed-scheduler: scheduled {cnt} prayer jobs for today; removing hourly checker")
+                        try:
+                            scheduler.remove_job('missed-scheduler')
+                        except Exception:
+                            pass
+                        # After successfully scheduling today's jobs, ensure the daily rescheduler exists
+                        _schedule_daily_rescheduler()
+                except Exception as e:
+                    logger.warning(f"Missed-scheduler attempt failed: {e}")
+
+            if 'missed-scheduler' not in [j.id for j in scheduler.get_jobs()]:
+                scheduler.add_job(_try_schedule_missed, trigger=IntervalTrigger(hours=1), id='missed-scheduler')
+                logger.info("Scheduled hourly missed-scheduler job to attempt scheduling today's Azan until success")
+        except Exception as e:
+            logger.warning(f"Failed to schedule hourly missed-scheduler: {e}")
+    else:
+        # If we scheduled jobs now, ensure the daily rescheduler is also scheduled
+        _schedule_daily_rescheduler()
 
 
 @app.route('/api/scheduler/jobs', methods=['GET'])
