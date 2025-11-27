@@ -192,6 +192,31 @@ def _http_post_play(filename):
         logger.error(f"Scheduled play POST failed for {filename}: {e}")
 
 
+def _append_play_history(filename, when=None):
+    """Append a successful play event to `logs/play_history.json` for later scheduling decisions."""
+    try:
+        os.makedirs('logs', exist_ok=True)
+        path = os.path.join('logs', 'play_history.json')
+        entry = {
+            'file': filename,
+            'ts': (when or datetime.now()).isoformat()
+        }
+        # Load existing
+        data = []
+        try:
+            with open(path, 'r') as f:
+                data = json.load(f)
+        except Exception:
+            data = []
+        data.append(entry)
+        # Keep only recent entries (e.g., last 100)
+        data = data[-100:]
+        with open(path, 'w') as f:
+            json.dump(data, f)
+    except Exception as e:
+        logger.warning(f"Failed to append play history: {e}")
+
+
 def schedule_prayers_for_date(target_date: date):
     """Compute prayer times for `target_date` and schedule Azan jobs.
 
@@ -209,9 +234,24 @@ def schedule_prayers_for_date(target_date: date):
         lon = float(os.environ.get('PRAYER_LON', '55.2708'))
         tz = get_localzone()
         pt = praytimes.PrayTimes()
-        # praytimes expects a (year, month, day) tuple; pass 0 as timezone offset
-        times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), 0)
+        # praytimes expects a (year, month, day) tuple and a timezone offset in hours.
+        # Compute the local timezone offset for the target date (may include DST)
+        try:
+            local_dt = datetime(target_date.year, target_date.month, target_date.day, tzinfo=tz)
+            offset_td = local_dt.utcoffset() or timedelta(0)
+            tz_offset_hours = offset_td.total_seconds() / 3600.0
+        except Exception:
+            tz_offset_hours = 0
+        # Pass the computed offset so returned times are in local time
+        times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz_offset_hours)
         prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
+        # Load recent play history to avoid treating test runs (far from scheduled time) as on-time plays.
+        play_history = []
+        try:
+            with open(os.path.join('logs', 'play_history.json'), 'r') as f:
+                play_history = json.load(f)
+        except Exception:
+            play_history = []
         for key in prayer_keys:
             tstr = times.get(key)
             if not tstr:
@@ -222,8 +262,35 @@ def schedule_prayers_for_date(target_date: date):
             # Create timezone-aware datetime using zoneinfo-compatible tz
             scheduled_dt = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
             now = datetime.now(tz)
-            if scheduled_dt <= now:
+            # Consider the prayer "served on time" only if a recorded play exists within
+            # +/- tolerance minutes of the scheduled time. This prevents manual/test plays
+            # outside the on-time window from affecting scheduling.
+            played_on_time = False
+            try:
+                tol_minutes = 5
+                for entry in play_history:
+                    try:
+                        p_ts = datetime.fromisoformat(entry.get('ts'))
+                        # Normalize timezone if naive
+                        if p_ts.tzinfo is None:
+                            p_ts = p_ts.replace(tzinfo=tz)
+                        delta = abs((p_ts - scheduled_dt).total_seconds())
+                        if delta <= tol_minutes * 60:
+                            # match by file name (fajr vs azan)
+                            fname = 'fajr.mp3' if key == 'fajr' else 'azan.mp3'
+                            if entry.get('file') and fname in entry.get('file'):
+                                played_on_time = True
+                                break
+                    except Exception:
+                        continue
+            except Exception:
+                played_on_time = False
+
+            if scheduled_dt <= now and not played_on_time:
                 logger.debug(f"Skipping past prayer {key} at {scheduled_dt}")
+                continue
+            if played_on_time:
+                logger.info(f"Prayer {key} at {scheduled_dt} already played on time; skipping schedule")
                 continue
             job_id = f"azan-{target_date.isoformat()}-{key}"
             existing = [j.id for j in scheduler.get_jobs()]
@@ -314,6 +381,23 @@ def list_scheduled_jobs():
     for j in scheduler.get_jobs():
         jobs.append({'id': j.id, 'next_run_time': str(j.next_run_time)})
     return jsonify({'available': True, 'jobs': jobs})
+
+
+@app.route('/api/scheduler/force-schedule', methods=['POST'])
+def api_force_schedule_today():
+    """Force a run of today's scheduling (useful for testing). Returns number of jobs scheduled."""
+    if not SCHEDULER_AVAILABLE:
+        return jsonify({'available': False, 'jobs_added': 0, 'message': 'Scheduler not available'})
+    try:
+        added = schedule_prayers_for_date(date.today())
+        # Ensure daily rescheduler exists
+        try:
+            schedule_today_and_rescheduler()
+        except Exception:
+            pass
+        return jsonify({'available': True, 'jobs_added': added})
+    except Exception as e:
+        return jsonify({'available': False, 'error': str(e)}), 500
 
 @app.route('/api/prepare', methods=['GET'])
 def prepare_group():
@@ -444,6 +528,11 @@ def play_audio():
                 if (audio_url in post_uri) or (post_state == 'PLAYING'):
                     AZAN_STARTED = True
                     logger.info("Azan start confirmed on coordinator")
+                    # Record play history for scheduling decisions (mark when playback actually started)
+                    try:
+                        _append_play_history(filename, when=datetime.now(tz))
+                    except Exception:
+                        pass
                 else:
                     # Treat as failure: do not retry later
                     logger.error("Coordinator did not start Azan (URI/state mismatch). Aborting single attempt.")
