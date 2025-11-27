@@ -15,6 +15,7 @@ try:
     from apscheduler.triggers.interval import IntervalTrigger
     import praytimes
     from tzlocal import get_localzone
+    import fcntl
     SCHEDULER_AVAILABLE = True
 except Exception:
     SCHEDULER_AVAILABLE = False
@@ -399,6 +400,51 @@ def api_force_schedule_today():
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)}), 500
 
+
+@app.route('/api/scheduler/simulate-play', methods=['POST'])
+def api_simulate_play():
+    """Simulate/apply a recorded play entry for testing scheduling logic.
+
+    Accepts JSON: {"file": "azan.mp3", "ts": "optional ISO timestamp"}
+    If `ts` is omitted, uses current time in local timezone.
+    This endpoint appends into `logs/play_history.json` and returns the last entries.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        fname = (data.get('file') or 'azan.mp3').strip()
+        ts_str = data.get('ts')
+        try:
+            tz = get_localzone()
+        except Exception:
+            tz = None
+        if ts_str:
+            try:
+                when = datetime.fromisoformat(ts_str)
+                if when.tzinfo is None and tz is not None:
+                    when = when.replace(tzinfo=tz)
+            except Exception:
+                return jsonify({'status': 'error', 'message': 'Invalid ts format; use ISO8601'}), 400
+        else:
+            when = datetime.now(tz)
+        # Append to play history
+        try:
+            _append_play_history(fname, when=when)
+        except Exception as e:
+            logger.warning(f"Failed to append simulated play history: {e}")
+            return jsonify({'status': 'error', 'message': str(e)}), 500
+        # Return recent history tail
+        path = os.path.join('logs', 'play_history.json')
+        recent = []
+        try:
+            with open(path, 'r') as f:
+                recent = json.load(f)
+        except Exception:
+            recent = []
+        return jsonify({'status': 'ok', 'appended': {'file': fname, 'ts': when.isoformat()}, 'history_tail': recent[-10:]})
+    except Exception as e:
+        logger.error(f"simulate-play error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 @app.route('/api/prepare', methods=['GET'])
 def prepare_group():
     """
@@ -718,3 +764,35 @@ if __name__ == '__main__':
         logger.info("Scheduler not available in this environment; automatic scheduling disabled")
 
     app.run(host='0.0.0.0', port=5000)
+
+# When running under gunicorn (imported module), __name__ != '__main__'.
+# Start the scheduler in exactly one process by using a filesystem lock so
+# multiple gunicorn workers do not each start duplicate schedulers.
+def _try_start_scheduler_with_lock():
+    global scheduler
+    LOCK_PATH = '/tmp/bilal_scheduler.lock'
+    if not SCHEDULER_AVAILABLE:
+        logger.info('Scheduler not available; skipping automatic scheduler start')
+        return
+    try:
+        fd = open(LOCK_PATH, 'w')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            logger.info('Another process holds scheduler lock; not starting scheduler in this worker')
+            fd.close()
+            return
+        # We acquired the lock — start the scheduler in this process
+        try:
+            scheduler = BackgroundScheduler()
+            scheduler.start()
+            logger.info('BackgroundScheduler started (lock owner)')
+            schedule_today_and_rescheduler()
+            logger.info(f"Scheduled jobs: {[j.id for j in scheduler.get_jobs()]}")
+        except Exception as e:
+            logger.error(f'Failed to start scheduler under lock: {e}')
+    except Exception as e:
+        logger.warning(f'Failed to acquire/start scheduler lock: {e}')
+
+# Try to start scheduler now (safe for gunicorn workers)
+_try_start_scheduler_with_lock()

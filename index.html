@@ -6,8 +6,7 @@
     <title>Bilal - Sonos Azan Controller</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <!-- Babel Standalone for in-browser compilation -->
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- Babel removed for Vite bundling; use native ES modules -->
     <style>
       body { font-family: 'Inter', sans-serif; background-color: #0f172a; color: white; }
       .scrollbar-hide::-webkit-scrollbar { display: none; }
@@ -31,7 +30,7 @@
   <body>
     <div id="root"></div>
     
-    <!-- Load the Application -->
-    <script type="text/babel" data-type="module" src="/index.tsx"></script>
+    <!-- Load the Application (Vite bundle entry) -->
+    <script type="module" src="/index.tsx"></script>
   </body>
 </html>
