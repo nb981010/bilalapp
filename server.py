@@ -268,7 +268,11 @@ def schedule_prayers_for_date(target_date: date):
             # outside the on-time window from affecting scheduling.
             played_on_time = False
             try:
-                tol_minutes = 5
+                # Allow overriding the play tolerance via environment variable
+                try:
+                    tol_minutes = int(os.environ.get('PRAYER_PLAY_TOL_MIN', '5'))
+                except Exception:
+                    tol_minutes = 5
                 for entry in play_history:
                     try:
                         p_ts = datetime.fromisoformat(entry.get('ts'))
