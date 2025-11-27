@@ -54,10 +54,26 @@ else:
   print('App.tsx not found, skipping patch')
 PY
 
-# Install Node.js dependencies
-echo "Installing Node.js dependencies..."
+# Install Node.js (NodeSource) and build tools, then build the frontend
+echo "Installing Node.js (NodeSource) and build tools..."
+# Install NodeSource Node.js 18.x LTS
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt-get install -y nodejs build-essential
 cd "$APP_DIR"
-npm install --production
+# Prefer reproducible install via npm ci when lockfile present
+if [ -f package-lock.json ]; then
+  npm ci --silent || npm install --silent
+else
+  npm install --silent
+fi
+# Build the frontend (Vite) so static assets exist in dist/
+if npm run build --silent; then
+  echo "Frontend build completed"
+else
+  echo "Frontend build failed (vite may be missing); attempting fallback install of dev deps and rebuild"
+  npm install --silent
+  npm run build --silent || echo "Frontend build ultimately failed"
+fi
 
 # 0. Fix Empty Files (Manual Recovery)
 # If server.txt exists but server.py is missing or empty, copy it.
