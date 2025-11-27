@@ -176,6 +176,8 @@ def list_zones():
 # Scheduler helpers (optional)
 # ---------------------------------------------------------
 scheduler = None
+# Track missed-scheduler attempts per date so we can adapt retry cadence.
+MISSED_SCHED_ATTEMPTS = {}
 
 def _http_post_play(filename):
     """POST to the local /api/play endpoint to trigger playback."""
@@ -259,28 +261,45 @@ def schedule_today_and_rescheduler():
             logger.warning(f"Failed to schedule daily rescheduler: {e}")
 
     # If nothing was scheduled for today (device may have been down at midnight),
-    # add an hourly retry job that will attempt to schedule today's prayers until successful.
+    # add a retry job that will attempt to schedule today's prayers until successful.
+    # Start with 5-minute retries for the first 6 attempts, then switch to hourly.
     if added == 0:
         try:
             def _try_schedule_missed():
                 try:
+                    key = date.today().isoformat()
+                    MISSED_SCHED_ATTEMPTS[key] = MISSED_SCHED_ATTEMPTS.get(key, 0) + 1
+                    attempts = MISSED_SCHED_ATTEMPTS[key]
+                    logger.info(f"Missed-scheduler attempt #{attempts} for {key}")
                     cnt = schedule_prayers_for_date(date.today())
                     if cnt > 0:
-                        logger.info(f"Missed-scheduler: scheduled {cnt} prayer jobs for today; removing hourly checker")
+                        logger.info(f"Missed-scheduler: scheduled {cnt} prayer jobs for today; removing retry job")
                         try:
                             scheduler.remove_job('missed-scheduler')
                         except Exception:
                             pass
                         # After successfully scheduling today's jobs, ensure the daily rescheduler exists
                         _schedule_daily_rescheduler()
+                        return
+                    # If we've tried 6 times at 5-minute intervals, switch to hourly retries
+                    if attempts >= 6:
+                        logger.info("Missed-scheduler reached 6 attempts; switching to hourly retries")
+                        try:
+                            scheduler.remove_job('missed-scheduler')
+                        except Exception:
+                            pass
+                        # Add a new job that runs hourly
+                        scheduler.add_job(_try_schedule_missed, trigger=IntervalTrigger(hours=1), id='missed-scheduler')
+                        return
+                    # Otherwise, continue retrying every 5 minutes (job remains)
                 except Exception as e:
                     logger.warning(f"Missed-scheduler attempt failed: {e}")
 
             if 'missed-scheduler' not in [j.id for j in scheduler.get_jobs()]:
-                scheduler.add_job(_try_schedule_missed, trigger=IntervalTrigger(hours=1), id='missed-scheduler')
-                logger.info("Scheduled hourly missed-scheduler job to attempt scheduling today's Azan until success")
+                scheduler.add_job(_try_schedule_missed, trigger=IntervalTrigger(minutes=5), id='missed-scheduler')
+                logger.info("Scheduled missed-scheduler job: 5-minute retries (first 6 attempts), then hourly")
         except Exception as e:
-            logger.warning(f"Failed to schedule hourly missed-scheduler: {e}")
+            logger.warning(f"Failed to schedule missed-scheduler: {e}")
     else:
         # If we scheduled jobs now, ensure the daily rescheduler is also scheduled
         _schedule_daily_rescheduler()
