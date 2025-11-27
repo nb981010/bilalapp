@@ -80,3 +80,13 @@ echo "App Directory: $APP_DIR"
 echo "Service User:  $REAL_USER"
 echo "App is running on port 5000."
 echo "View logs: tail -f /logs/sys.log"
+
+# Environment configuration
+# The backend service reads environment variables from `/home/nbc/bilalapp/.env` when started
+# via systemd. You can set the preferred on-time tolerance (minutes) for playback detection
+# by editing that file and setting `PRAYER_PLAY_TOL_MIN`.
+# Example:
+#   PRAYER_PLAY_TOL_MIN=5
+# After editing `/home/nbc/bilalapp/.env`, reload and restart the service:
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart bilal-beapp.service
