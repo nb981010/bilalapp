@@ -8,6 +8,7 @@ import subprocess
 from datetime import datetime, date, timedelta
 from flask import Flask, send_from_directory, jsonify, request
 from subprocess import PIPE, Popen
+from zoneinfo import ZoneInfo
 
 # Optional scheduler/prayer time imports (installed by install.sh)
 try:
@@ -20,6 +21,30 @@ try:
     SCHEDULER_AVAILABLE = True
 except Exception:
     SCHEDULER_AVAILABLE = False
+
+
+def get_prayer_tz():
+    """Return timezone to use for prayer calculations.
+
+    Priority:
+      1. `PRAYER_TZ` environment variable (ZoneInfo name)
+      2. system local zone via tzlocal
+      3. fallback to UTC
+    """
+    tz_env = os.environ.get('PRAYER_TZ')
+    if tz_env:
+        try:
+            return ZoneInfo(tz_env)
+        except Exception:
+            # invalid env value; fall through to system tz
+            pass
+    try:
+        return get_localzone()
+    except Exception:
+        try:
+            return ZoneInfo('UTC')
+        except Exception:
+            return None
 
 # Configure Logging
 logging.basicConfig(
@@ -210,7 +235,7 @@ def api_prayer_times():
                 pass
         lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
         lon = float(os.environ.get('PRAYER_LON', '55.2708'))
-        tz = get_localzone()
+        tz = get_prayer_tz()
         pt = praytimes.PrayTimes()
         try:
             local_dt = datetime(tgt.year, tgt.month, tgt.day, tzinfo=tz)
@@ -243,6 +268,18 @@ def _http_post_play(filename):
             logger.info(f"Scheduled play triggered for {filename}: {resp.status} {resp_body}")
     except Exception as e:
         logger.error(f"Scheduled play POST failed for {filename}: {e}")
+
+
+def _http_get_prepare():
+    """GET the local /api/prepare endpoint to prepare zones for Azan."""
+    try:
+        import urllib.request
+        req = urllib.request.Request('http://127.0.0.1:5000/api/prepare')
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp_body = resp.read().decode('utf-8')
+            logger.info(f"Scheduled prepare triggered: {resp.status} {resp_body}")
+    except Exception as e:
+        logger.error(f"Scheduled prepare GET failed: {e}")
 
 
 def _append_play_history(filename, when=None):
@@ -285,7 +322,7 @@ def schedule_prayers_for_date(target_date: date):
         # Get coordinates from environment variables if provided, else default to Dubai
         lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
         lon = float(os.environ.get('PRAYER_LON', '55.2708'))
-        tz = get_localzone()
+        tz = get_prayer_tz()
         # Prefer computing times with the frontend `adhan` implementation via our Node helper
         times = None
         try:
@@ -394,7 +431,7 @@ def schedule_today_and_rescheduler():
     """Schedule today's prayers and a daily rescheduler at 00:05 local time."""
     if not SCHEDULER_AVAILABLE:
         return
-    tz = get_localzone()
+    tz = get_prayer_tz()
     today = date.today()
 
     # Attempt to schedule today's prayers and record how many jobs were added.
@@ -464,8 +501,25 @@ def list_scheduled_jobs():
     if not SCHEDULER_AVAILABLE or not scheduler:
         return jsonify({'available': False, 'jobs': []})
     jobs = []
+    prayer_tz = get_prayer_tz()
     for j in scheduler.get_jobs():
-        jobs.append({'id': j.id, 'next_run_time': str(j.next_run_time)})
+        nrt = j.next_run_time
+        if nrt is None:
+            nrt_str = None
+            nrt_local = None
+        else:
+            try:
+                nrt_str = nrt.isoformat()
+            except Exception:
+                nrt_str = str(nrt)
+            try:
+                if prayer_tz is not None:
+                    nrt_local = nrt.astimezone(prayer_tz).isoformat()
+                else:
+                    nrt_local = nrt.isoformat()
+            except Exception:
+                nrt_local = str(nrt)
+        jobs.append({'id': j.id, 'next_run_time': nrt_str, 'next_run_time_in_prayer_tz': nrt_local})
     return jsonify({'available': True, 'jobs': jobs})
 
 

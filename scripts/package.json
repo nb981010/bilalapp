@@ -1,0 +1,8 @@
+{
+  "name": "bilal-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "adhan": "^4.0.0"
+  }
+}
