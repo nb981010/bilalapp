@@ -98,6 +98,18 @@ chmod 664 "$DB_PATH" || true
 
 if [ $INSTALL_SERVICE -eq 1 ]; then
   echo "Creating systemd unit at $SERVICE_PATH (requires sudo)"
+  # Write an env file that the unit will consume
+  ENV_PATH="/etc/default/bilal"
+  echo "Writing environment file to $ENV_PATH (requires sudo)"
+  sudo tee "$ENV_PATH" > /dev/null <<ENV
+# Environment file for bilal service
+PRAYER_TZ=Asia/Dubai
+BILAL_DB_PATH=$DB_PATH
+APP_DIR=$APP_DIR
+VENV_DIR=$VENV_DIR
+ENV
+
+  echo "Creating systemd unit at $SERVICE_PATH (requires sudo)"
   sudo tee "$SERVICE_PATH" > /dev/null <<UNIT
 [Unit]
 Description=Bilal Azan Scheduler Service
@@ -107,9 +119,8 @@ After=network.target
 Type=simple
 User=$RUN_USER
 WorkingDirectory=$APP_DIR
-Environment=PRAYER_TZ=Asia/Dubai
-Environment=BILAL_DB_PATH=$DB_PATH
-ExecStart=$VENV_DIR/bin/python3 $APP_DIR/server.py
+EnvironmentFile=$ENV_PATH
+ExecStart=${VENV_DIR}/bin/python3 ${APP_DIR}/server.py
 Restart=always
 RestartSec=5
 
