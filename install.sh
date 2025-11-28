@@ -21,6 +21,7 @@ Usage: $0 [--service] [--start]
   --no-node    : skip installing Node deps
   --user USER  : systemd unit will run as USER (default: current user)
   --force-env  : overwrite existing /etc/default/bilal if present
+  --create-user: create the specified system user if it does not exist (requires sudo)
 EOF
   exit 1
 }
@@ -29,6 +30,7 @@ INSTALL_SERVICE=0
 START_SERVICE=0
 INSTALL_NODE=1
 FORCE_ENV=0
+CREATE_USER=0
 RUN_USER="$(id -un)"
 
 while [[ $# -gt 0 ]]; do
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --no-node) INSTALL_NODE=0; shift ;;
     --user) RUN_USER="$2"; shift 2 ;;
     --force-env) FORCE_ENV=1; shift ;;
+    --create-user) CREATE_USER=1; shift ;;
     -h|--help) usage ;;
     *) echo "Unknown arg: $1"; usage ;;
   esac
@@ -103,6 +106,25 @@ if [ $INSTALL_SERVICE -eq 1 ]; then
   echo "Creating systemd unit at $SERVICE_PATH (requires sudo)"
   # Write an env file that the unit will consume (preserve if exists unless forced)
   ENV_PATH="/etc/default/bilal"
+  # Optionally create the system user before writing the env / enabling the unit
+  if [ "$CREATE_USER" -eq 1 ] || [ "$RUN_USER" = "bilal" ]; then
+    echo "Ensuring system user '$RUN_USER' exists (requires sudo)..."
+    if id -u "$RUN_USER" >/dev/null 2>&1; then
+      echo "User '$RUN_USER' already exists. Skipping creation."
+    else
+      if [ -f "$APP_DIR/systemd/create_bilal_user.sh" ]; then
+        echo "Calling helper to create user: $APP_DIR/systemd/create_bilal_user.sh $APP_DIR $RUN_USER"
+        sudo bash "$APP_DIR/systemd/create_bilal_user.sh" "$APP_DIR" "$RUN_USER"
+      else
+        echo "Helper script not found; creating user via useradd"
+        sudo useradd --system --create-home --shell /usr/sbin/nologin "$RUN_USER"
+        sudo mkdir -p /home/$RUN_USER
+        sudo chown -R $RUN_USER:$RUN_USER /home/$RUN_USER
+        sudo chown -R $RUN_USER:$RUN_USER "$APP_DIR"
+      fi
+    fi
+  fi
+
   if [ -f "$ENV_PATH" ] && [ $FORCE_ENV -ne 1 ]; then
     echo "$ENV_PATH already exists — preserving it (use --force-env to overwrite)"
   else
