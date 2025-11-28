@@ -1,0 +1,9 @@
+[project]
+name = "bilalapp"
+version = "0.1.0"
+description = "Azan scheduler and Sonos controller"
+requires-python = ">=3.8"
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"

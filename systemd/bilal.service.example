@@ -1,0 +1,16 @@
+[Unit]
+Description=Bilal Azan Scheduler Service (example)
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER_HERE
+WorkingDirectory=/root/code/bilalapp
+Environment=PRAYER_TZ=Asia/Dubai
+Environment=BILAL_DB_PATH=/root/code/bilalapp/bilal_jobs.sqlite
+ExecStart=/root/code/bilalapp/.venv/bin/python3 /root/code/bilalapp/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
