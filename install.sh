@@ -20,6 +20,7 @@ Usage: $0 [--service] [--start]
   --start      : start the service after enabling
   --no-node    : skip installing Node deps
   --user USER  : systemd unit will run as USER (default: current user)
+  --force-env  : overwrite existing /etc/default/bilal if present
 EOF
   exit 1
 }
@@ -27,6 +28,7 @@ EOF
 INSTALL_SERVICE=0
 START_SERVICE=0
 INSTALL_NODE=1
+FORCE_ENV=0
 RUN_USER="$(id -un)"
 
 while [[ $# -gt 0 ]]; do
@@ -35,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     --start) START_SERVICE=1; shift ;;
     --no-node) INSTALL_NODE=0; shift ;;
     --user) RUN_USER="$2"; shift 2 ;;
+    --force-env) FORCE_ENV=1; shift ;;
     -h|--help) usage ;;
     *) echo "Unknown arg: $1"; usage ;;
   esac
@@ -98,16 +101,20 @@ chmod 664 "$DB_PATH" || true
 
 if [ $INSTALL_SERVICE -eq 1 ]; then
   echo "Creating systemd unit at $SERVICE_PATH (requires sudo)"
-  # Write an env file that the unit will consume
+  # Write an env file that the unit will consume (preserve if exists unless forced)
   ENV_PATH="/etc/default/bilal"
-  echo "Writing environment file to $ENV_PATH (requires sudo)"
-  sudo tee "$ENV_PATH" > /dev/null <<ENV
+  if [ -f "$ENV_PATH" ] && [ $FORCE_ENV -ne 1 ]; then
+    echo "$ENV_PATH already exists — preserving it (use --force-env to overwrite)"
+  else
+    echo "Writing environment file to $ENV_PATH (requires sudo)"
+    sudo tee "$ENV_PATH" > /dev/null <<ENV
 # Environment file for bilal service
 PRAYER_TZ=Asia/Dubai
 BILAL_DB_PATH=$DB_PATH
 APP_DIR=$APP_DIR
 VENV_DIR=$VENV_DIR
 ENV
+  fi
 
   echo "Creating systemd unit at $SERVICE_PATH (requires sudo)"
   sudo tee "$SERVICE_PATH" > /dev/null <<UNIT

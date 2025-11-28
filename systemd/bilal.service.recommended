@@ -1,0 +1,15 @@
+[Unit]
+Description=Bilal Azan Scheduler Service (recommended)
+After=network.target
+
+[Service]
+Type=simple
+User=bilal
+WorkingDirectory=/root/code/bilalapp
+EnvironmentFile=/etc/default/bilal
+ExecStart=/root/code/bilalapp/.venv/bin/python3 /root/code/bilalapp/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
