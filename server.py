@@ -1,5 +1,6 @@
 import os
 import time
+import uuid
 import threading
 import logging
 import socket
@@ -9,6 +10,7 @@ from datetime import datetime, date, timedelta
 from flask import Flask, send_from_directory, jsonify, request
 from subprocess import PIPE, Popen
 from zoneinfo import ZoneInfo
+import sqlite3
 
 # Optional scheduler/prayer time imports (installed by install.sh)
 try:
@@ -19,8 +21,17 @@ try:
     from tzlocal import get_localzone
     import fcntl
     SCHEDULER_AVAILABLE = True
+    # Optional SQLAlchemy jobstore support
+    try:
+        from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+        SQLALCHEMY_AVAILABLE = True
+    except Exception:
+        SQLALCHEMY_AVAILABLE = False
 except Exception:
     SCHEDULER_AVAILABLE = False
+
+# Path to SQLite DB (used for APScheduler jobstore and play history)
+DB_PATH = os.environ.get('BILAL_DB_PATH', 'bilal_jobs.sqlite')
 
 
 def get_prayer_tz():
@@ -145,6 +156,17 @@ def get_sonos_speakers():
             logger.error(f"Error during Sonos discovery (attempt {attempt+1}): {e}")
     logger.error("Failed to discover any Sonos speakers after all retries")
     return []
+
+
+def _write_play_session_event(event: dict):
+    """Append a structured JSON event to `logs/play_sessions.log` (one JSON object per line)."""
+    try:
+        os.makedirs('logs', exist_ok=True)
+        path = os.path.join('logs', 'play_sessions.log')
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(event, ensure_ascii=False) + '\n')
+    except Exception as e:
+        logger.warning(f"Failed to write play session event: {e}")
 
 # ---------------------------------------------------------
 # Routes
@@ -284,27 +306,66 @@ def _http_get_prepare():
 
 def _append_play_history(filename, when=None):
     """Append a successful play event to `logs/play_history.json` for later scheduling decisions."""
+    # Deprecated: replaced by SQLite-backed play history helpers.
+    try:
+        append_play_history_sql(filename, when=when)
+    except Exception as e:
+        logger.warning(f"Failed to append play history (sqlite): {e}")
+
+
+def init_db(db_path=None):
+    """Initialize SQLite DB and ensure required tables exist."""
+    db = db_path or DB_PATH
+    try:
+        conn = sqlite3.connect(db)
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS play_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file TEXT NOT NULL,
+                ts TEXT NOT NULL
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"init_db failed: {e}")
+
+
+def append_play_history_sql(filename, when=None):
+    """Insert a play history row into SQLite and prune old entries."""
     try:
         os.makedirs('logs', exist_ok=True)
-        path = os.path.join('logs', 'play_history.json')
-        entry = {
-            'file': filename,
-            'ts': (when or datetime.now()).isoformat()
-        }
-        # Load existing
-        data = []
+        tz = get_prayer_tz() or ZoneInfo('UTC')
+        ts = (when or datetime.now(tz)).isoformat()
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('INSERT INTO play_history (file, ts) VALUES (?, ?)', (filename, ts))
+        conn.commit()
         try:
-            with open(path, 'r') as f:
-                data = json.load(f)
+            # Keep only recent 100 rows
+            c.execute('DELETE FROM play_history WHERE id NOT IN (SELECT id FROM play_history ORDER BY id DESC LIMIT 100)')
+            conn.commit()
         except Exception:
-            data = []
-        data.append(entry)
-        # Keep only recent entries (e.g., last 100)
-        data = data[-100:]
-        with open(path, 'w') as f:
-            json.dump(data, f)
+            pass
+        conn.close()
     except Exception as e:
-        logger.warning(f"Failed to append play history: {e}")
+        logger.warning(f"append_play_history_sql failed: {e}")
+
+
+def read_recent_play_history(limit=100):
+    """Return recent play history rows as list of dicts ordered oldest->newest."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT file, ts FROM play_history ORDER BY id DESC LIMIT ?', (limit,))
+        rows = c.fetchall()
+        conn.close()
+        rows.reverse()
+        return [{'file': r[0], 'ts': r[1]} for r in rows]
+    except Exception as e:
+        logger.warning(f"read_recent_play_history failed: {e}")
+        return []
 
 
 def schedule_prayers_for_date(target_date: date):
@@ -364,11 +425,9 @@ def schedule_prayers_for_date(target_date: date):
             # Pass the computed offset so returned times are in local time
             times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz_offset_hours)
         prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
-        # Load recent play history to avoid treating test runs (far from scheduled time) as on-time plays.
-        play_history = []
+        # Load recent play history from SQLite
         try:
-            with open(os.path.join('logs', 'play_history.json'), 'r') as f:
-                play_history = json.load(f)
+            play_history = read_recent_play_history(100)
         except Exception:
             play_history = []
         for key in prayer_keys:
@@ -571,17 +630,87 @@ def api_simulate_play():
         except Exception as e:
             logger.warning(f"Failed to append simulated play history: {e}")
             return jsonify({'status': 'error', 'message': str(e)}), 500
-        # Return recent history tail
-        path = os.path.join('logs', 'play_history.json')
-        recent = []
+        # Return recent history tail (from SQLite)
         try:
-            with open(path, 'r') as f:
-                recent = json.load(f)
+            recent = read_recent_play_history(10)
         except Exception:
             recent = []
-        return jsonify({'status': 'ok', 'appended': {'file': fname, 'ts': when.isoformat()}, 'history_tail': recent[-10:]})
+        return jsonify({'status': 'ok', 'appended': {'file': fname, 'ts': when.isoformat()}, 'history_tail': recent})
     except Exception as e:
         logger.error(f"simulate-play error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/transport', methods=['GET'])
+def api_transport():
+    """Return detailed transport and track info for discovered Sonos speakers."""
+    try:
+        speakers = get_sonos_speakers()
+        if not speakers:
+            return jsonify({'status': 'error', 'message': 'No speakers found'}), 404
+        # Choose coordinator
+        coordinator = next((s for s in speakers if getattr(s, 'is_coordinator', False)), speakers[0])
+        result = {'coordinator': {'name': coordinator.player_name, 'uid': getattr(coordinator, 'uid', None)}, 'speakers': []}
+        for s in speakers:
+            try:
+                transport = s.get_current_transport_info()
+            except Exception:
+                transport = {}
+            try:
+                track = s.get_current_track_info()
+            except Exception:
+                track = {}
+            result['speakers'].append({
+                'uid': getattr(s, 'uid', None),
+                'name': getattr(s, 'player_name', None),
+                'is_coordinator': getattr(s, 'is_coordinator', False),
+                'volume': getattr(s, 'volume', None),
+                'transport': transport,
+                'track': track
+            })
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"api_transport error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/transport/stop', methods=['POST'])
+def api_transport_stop():
+    """Stop coordinator playback and unjoin other speakers (best-effort).
+
+    Optional JSON payload: {"unjoin": true} (default true)
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+        do_unjoin = payload.get('unjoin', True)
+        speakers = get_sonos_speakers()
+        if not speakers:
+            return jsonify({'status': 'error', 'message': 'No speakers found'}), 404
+        coordinator = next((s for s in speakers if getattr(s, 'is_coordinator', False)), speakers[0])
+        results = {'coordinator': coordinator.player_name, 'stopped': False, 'unjoined': []}
+        try:
+            coordinator.stop()
+            results['stopped'] = True
+        except Exception as e:
+            logger.warning(f"Failed to stop coordinator {coordinator.player_name}: {e}")
+        if do_unjoin:
+            for s in speakers:
+                if s == coordinator:
+                    continue
+                try:
+                    s.unjoin()
+                    results['unjoined'].append(getattr(s, 'player_name', None))
+                except Exception as e:
+                    logger.warning(f"Failed to unjoin {getattr(s, 'player_name', None)}: {e}")
+        # Log a stop event for the active session if present
+        try:
+            event = {'event': 'stop', 'timestamp': datetime.now(get_prayer_tz() or ZoneInfo('UTC')).isoformat(), 'coordinator': coordinator.player_name}
+            _write_play_session_event(event)
+        except Exception:
+            pass
+        return jsonify(results)
+    except Exception as e:
+        logger.error(f"api_transport_stop error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @app.route('/api/prepare', methods=['GET'])
@@ -640,6 +769,12 @@ def play_audio():
         filename = 'azan.mp3'
 
     logger.info(f"Received Play Request: {requested} -> mapped to: {filename}")
+    # Create a play session id and timezone for structured logging
+    session_id = str(uuid.uuid4())
+    try:
+        tz = get_prayer_tz() or ZoneInfo('UTC')
+    except Exception:
+        tz = None
 
     try:
         speakers = get_sonos_speakers()
@@ -718,6 +853,20 @@ def play_audio():
                         _append_play_history(filename, when=datetime.now(tz))
                     except Exception:
                         pass
+                    # Structured play-session start event
+                    try:
+                        event = {
+                            'event': 'start',
+                            'session_id': session_id,
+                            'file': filename,
+                            'coordinator': coordinator.player_name,
+                            'coordinator_uid': getattr(coordinator, 'uid', None),
+                            'speakers': [getattr(s, 'player_name', str(s)) for s in speakers],
+                            'start_ts': (datetime.now(tz).isoformat() if tz is not None else datetime.now().isoformat())
+                        }
+                        _write_play_session_event(event)
+                    except Exception as e:
+                        logger.warning(f"Failed to write session start event: {e}")
                 else:
                     # Treat as failure: do not retry later
                     logger.error("Coordinator did not start Azan (URI/state mismatch). Aborting single attempt.")
@@ -738,7 +887,7 @@ def play_audio():
 
         # Start Monitoring Thread
         PLAYBACK_ACTIVE = True
-        threading.Thread(target=monitor_playback, args=(coordinator, speakers, audio_url)).start()
+        threading.Thread(target=monitor_playback, args=(coordinator, speakers, audio_url, session_id)).start()
 
         return jsonify({"status": "success", "message": "Playback Started"})
 
@@ -746,7 +895,7 @@ def play_audio():
         logger.error(f"Play Error: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-def monitor_playback(coordinator, speakers, audio_url):
+def monitor_playback(coordinator, speakers, audio_url, session_id=None):
     """
     Monitors playback for 3 minutes, enforcing Azan priority by overriding interruptions and resuming from interrupted position.
     Restores state after the full duration.
@@ -885,13 +1034,38 @@ def monitor_playback(coordinator, speakers, audio_url):
         else:
             logger.warning(f"No snapshot found for {s.player_name}")
     logger.info("Azan playback and restore completed")
+    # Structured play-session end event
+    try:
+        try:
+            tz = get_prayer_tz() or ZoneInfo('UTC')
+        except Exception:
+            tz = None
+        end_event = {
+            'event': 'end',
+            'session_id': session_id,
+            'file': audio_url.split('/')[-1] if audio_url else None,
+            'end_ts': (datetime.now(tz).isoformat() if tz is not None else datetime.now().isoformat()),
+            'restored': True
+        }
+        _write_play_session_event(end_event)
+    except Exception as e:
+        logger.warning(f"Failed to write session end event: {e}")
 
 if __name__ == '__main__':
     logger.info("Server Starting on Port 5000...")
     # Initialize and start scheduler if available
     if SCHEDULER_AVAILABLE:
         try:
-            scheduler = BackgroundScheduler()
+            # Ensure DB exists for jobstore and play history
+            try:
+                init_db(DB_PATH)
+            except Exception:
+                pass
+            if SQLALCHEMY_AVAILABLE:
+                jobstores = {'default': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH}')}
+                scheduler = BackgroundScheduler(jobstores=jobstores)
+            else:
+                scheduler = BackgroundScheduler()
             scheduler.start()
             logger.info("BackgroundScheduler started")
             # Schedule today's prayers and a daily rescheduler job
@@ -923,7 +1097,16 @@ def _try_start_scheduler_with_lock():
             return
         # We acquired the lock — start the scheduler in this process
         try:
-            scheduler = BackgroundScheduler()
+            # Ensure DB exists for jobstore and play history
+            try:
+                init_db(DB_PATH)
+            except Exception:
+                pass
+            if SQLALCHEMY_AVAILABLE:
+                jobstores = {'default': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH}')}
+                scheduler = BackgroundScheduler(jobstores=jobstores)
+            else:
+                scheduler = BackgroundScheduler()
             scheduler.start()
             logger.info('BackgroundScheduler started (lock owner)')
             schedule_today_and_rescheduler()
