@@ -1,0 +1,19 @@
+[Unit]
+Description=Bilal App (Sonos Azan Controller)
+After=network.target
+
+[Service]
+Type=simple
+User=nbc
+WorkingDirectory=/home/nbc/bilalapp
+Environment=PATH=/home/nbc/bilalapp/.venv/bin:/usr/bin:/bin
+Environment=PYTHONPATH=/home/nbc/bilalapp
+# Run the server as a module so APScheduler textual refs (server:func) resolve correctly
+ExecStart=/home/nbc/bilalapp/.venv/bin/python -m server
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
