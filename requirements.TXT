@@ -5,4 +5,6 @@ schedule
 python-dotenv
 gunicorn
 apscheduler
+SQLAlchemy
 tzlocal
+pytest

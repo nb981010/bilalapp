@@ -8,7 +8,7 @@ import {
   AppState 
 } from './types.ts';
 import { INITIAL_ZONES } from './constants.ts';
-import { getPrayerTimes, getNextPrayer } from './services/prayerService.ts';
+import { getPrayerTimes, getNextPrayer, getPrayerSource } from './services/prayerService.ts';
 import LogsViewer from './components/LogsViewer.tsx';
 import ZoneGrid from './components/ZoneGrid.tsx';
 import InstallScriptModal from './components/InstallScriptModal.tsx';
@@ -29,6 +29,7 @@ const App: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [schedule, setSchedule] = useState<PrayerSchedule[]>([]);
   const [nextPrayer, setNextPrayer] = useState<PrayerSchedule | null>(null);
+  const [prayerSource, setPrayerSource] = useState<string>('Local');
   const [zones, setZones] = useState<SonosZone[]>(INITIAL_ZONES);
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -43,9 +44,12 @@ const App: React.FC = () => {
   // Fetch schedule on mount
   useEffect(() => {
     const fetchSchedule = async () => {
-      const dailySchedule = await getPrayerTimes(new Date());
+      const now = new Date();
+      const dailySchedule = await getPrayerTimes(now);
       setSchedule(dailySchedule);
       setNextPrayer(getNextPrayer(dailySchedule));
+      const src = await getPrayerSource(now);
+      setPrayerSource(src);
     };
     fetchSchedule();
   }, []);
@@ -198,6 +202,8 @@ const App: React.FC = () => {
         const dailySchedule = await getPrayerTimes(now);
         setSchedule(dailySchedule);
         setNextPrayer(getNextPrayer(dailySchedule));
+        const src = await getPrayerSource(now);
+        setPrayerSource(src);
       }
     };
 
@@ -286,6 +292,11 @@ const App: React.FC = () => {
                    (-{getTimeRemaining()})
                  </span>
                </div>
+                <div className="mt-2">
+                  <span className="text-xs px-2 py-1 rounded-full bg-slate-800 text-slate-300 border border-slate-700">
+                    Source: {prayerSource}
+                  </span>
+                </div>
             </div>
         </div>
 
