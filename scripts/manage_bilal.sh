@@ -120,6 +120,8 @@ status() {
 do_start() {
   echo "Preparing to start Bilal app..."
   ensure_logs_dir
+  # Ensure `dist` ownership/permissions so frontend builds (ExecStartPre) won't hit EACCES
+  ensure_dist_permissions || true
   # Ensure ports are clear
   for p in "${PORTS[@]}"; do
     kill_port_procs "$p"
@@ -143,6 +145,17 @@ do_start() {
   fi
 
   echo "Start sequence complete. Check logs with: sudo journalctl -u $SERVICE_NAME -f";
+}
+
+ensure_dist_permissions() {
+  # Make sure the built assets are owned by the `bilal` user and writable
+  # This prevents EACCES when systemd runs the ExecStartPre `npm run build` step.
+  local dist_dir="$ROOT_DIR/dist"
+  if [ -d "$dist_dir" ]; then
+    echo "Ensuring ownership and permissions on $dist_dir"
+    sudo chown -R bilal:bilal "$dist_dir" || true
+    sudo chmod -R u+rwX,go+rX "$dist_dir" || true
+  fi
 }
 
 do_stop() {

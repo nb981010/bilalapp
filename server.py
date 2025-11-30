@@ -1742,4 +1742,11 @@ def _try_start_scheduler_with_lock():
         logger.warning(f'Failed to acquire/start scheduler lock: {e}')
 
 # Try to start scheduler now (safe for gunicorn workers)
-_try_start_scheduler_with_lock()
+# Only attempt automatic start when imported under a WSGI server (not when running
+# ad-hoc in tests or interactive imports). This avoids permission/lock issues during
+# import-time execution in developer environments.
+if __name__ != '__main__':
+    try:
+        _try_start_scheduler_with_lock()
+    except Exception:
+        logger.debug('Skipping scheduler lock start on import')
