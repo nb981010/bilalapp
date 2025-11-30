@@ -34,4 +34,29 @@ The backend exposes a few helpful endpoints for diagnosing scheduler state and t
 - `POST /api/scheduler/force-schedule` : forces a rescan and scheduling run for today.
 - `POST /api/scheduler/simulate-play` : append a simulated play-history event for testing scheduling logic. JSON body example: `{"file":"azan.mp3","ts":"2025-11-27T18:31:00+04:00"}`.
 
+## Settings & Testing (UI)
+
+The app includes a passcode-protected Settings modal (click the gear icon in the header).
+
+- Default passcode: `1234` (change via the Settings -> General -> Change Passcode UI).
+- General tab: change latitude, longitude, calculation method, and Asr madhab — these are saved to `localStorage` and used by the client prayer-time calculator.
+- Testing tab: run a Test Azan in `simulate` mode (UI-only), or trigger server test plays.
+- `Append Play History` will call the backend's test endpoint and insert play-history entries used by scheduler logic.
+
+Server exposes a test endpoint for controlled test behavior:
+
+- `POST /api/test/play` : simulate a play on the server by appending a play-history entry. JSON body example: `{"file":"azan.mp3","volume":50}`. This endpoint does not attempt real Sonos control and is safe for testing.
+
+Backend settings endpoints (stored in SQLite `bilal_jobs.sqlite` by default):
+
+- `GET /api/settings` : returns current production settings (falls back to defaults: Dubai coords, IACAD, Shafi, CSS/adahn/sonos modes = online).
+- `POST /api/settings` : update production settings. JSON body example: `{"prayer_lat":"25.2048","prayer_lon":"55.2708","calc_method":"IACAD","asr_madhab":"Shafi","css_mode":"online","adhan_mode":"online","sonos_mode":"online"}`.
+- `GET /api/test/settings` and `POST /api/test/settings` : same schema but stored separately for test environment.
+
+When the Settings UI saves values they are written to `settings` (production) or `test_settings` (testing) DB tables. The server's scheduling and prayer calculations prefer DB-configured values and will fall back to the defaults when missing.
+
+
 Use `journalctl -u bilal-beapp.service -f` to follow Gunicorn/server logs (they are sent to journald).
+
+Quick links
+- `CODE_OF_CONDUCT.md`: Operational rules, defaults, fallbacks, testing isolation, and safe service handling.

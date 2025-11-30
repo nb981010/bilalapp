@@ -1,0 +1,15 @@
+[Unit]
+Description=Bilal Frontend Dev Service (bilal-feapp)
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER_HERE
+WorkingDirectory=/root/code/bilalapp
+# Use npm to run the dev frontend; ensure node/npm installed
+ExecStart=/bin/bash -lc "cd /root/code/bilalapp && npm run dev"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

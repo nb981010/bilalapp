@@ -3,16 +3,18 @@ import { DUBAI_COORDS } from '../constants.ts';
 import { PrayerName, PrayerSchedule } from '../types.ts';
 
 const toSchedule = (raw: any): PrayerSchedule[] => {
-  // raw times are strings "HH:MM"; convert to Date objects for today
-  // Exclude Sunrise and any non-prayer sunrise/sunset entries from the schedule
-  const today = new Date();
-  const dateStr = raw?.date || today.toISOString().slice(0,10);
+  // raw times are strings "HH:MM" in local timezone from backend
+  // Convert to Date objects for today in local timezone
+  const dateStr = raw?.date || new Date().toISOString().slice(0,10);
   const [y, m, d] = dateStr.split('-').map((s: string) => parseInt(s, 10));
+  
   const mk = (hhmm: string | undefined) => {
     if (!hhmm) return new Date();
     const [hh, mm] = hhmm.split(':').map((s: string) => parseInt(s, 10));
-    return new Date(y, m - 1, d, hh || 0, mm || 0, 0);
+    // Create Date object in local timezone
+    return new Date(y, m - 1, d, hh, mm, 0);
   };
+  
   return [
     { name: PrayerName.Fajr, time: mk(raw.fajr), isNext: false },
     { name: PrayerName.Dhuhr, time: mk(raw.dhuhr), isNext: false },
@@ -56,10 +58,12 @@ export const getPrayerTimes = async (date: Date): Promise<PrayerSchedule[]> => {
   // Calculation method and madhab
   let methodParams: any;
   try {
-    if (calcMethod === 'Dubai') methodParams = CalculationMethod.Dubai();
-    else if (calcMethod === 'ISNA') methodParams = CalculationMethod.ISNA();
-    else if (calcMethod === 'Makkah') methodParams = CalculationMethod.Makkah();
-    else if (calcMethod === 'Egypt') methodParams = CalculationMethod.Egypt();
+    if (calcMethod === 'IACAD' || calcMethod === 'Dubai') methodParams = CalculationMethod.Dubai();
+    else if (calcMethod === 'ISNA') methodParams = CalculationMethod.NorthAmerica();
+    else if (calcMethod === 'Makkah') methodParams = CalculationMethod.UmmAlQura();
+    else if (calcMethod === 'Egypt') methodParams = CalculationMethod.Egyptian();
+    else if (calcMethod === 'Karachi') methodParams = CalculationMethod.Karachi();
+    else if (calcMethod === 'Turkey') methodParams = CalculationMethod.Turkey();
     else methodParams = CalculationMethod.Dubai();
   } catch (e) {
     methodParams = CalculationMethod.Dubai();

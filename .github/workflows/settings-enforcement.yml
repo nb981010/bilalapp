@@ -1,0 +1,22 @@
+name: Settings API Enforcement
+
+on:
+  pull_request:
+    paths:
+      - 'components/**'
+      - 'server.py'
+      - 'scripts/**'
+
+jobs:
+  check-settings-usage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python (for sed/grep availability)
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+      - name: Make check script executable
+        run: chmod +x scripts/check_settings_api_usage.sh || true
+      - name: Run settings API usage check
+        run: scripts/check_settings_api_usage.sh

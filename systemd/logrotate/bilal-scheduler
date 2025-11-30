@@ -1,0 +1,13 @@
+/opt/bilalapp/logs/scheduler.log /opt/bilalapp/logs/sys.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    create 0640 bilal bilal
+    sharedscripts
+    postrotate
+        # notify systemd to reopen logs if necessary (scheduler logs to file)
+        systemctl kill -s HUP bilal-scheduler.service >/dev/null 2>&1 || true
+    endscript
+}

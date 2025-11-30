@@ -1,0 +1,25 @@
+[Unit]
+Description=Bilal Scheduler Service
+After=network.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=bilal
+WorkingDirectory=/opt/bilalapp
+ExecStart=/opt/bilalapp/.venv/bin/python3 /opt/bilalapp/scripts/scheduler_runner.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+# Resource limits and sandboxing
+LimitNOFILE=4096
+MemoryLimit=200M
+PrivateTmp=true
+# Keep primary logs in journal, but scheduler_runner and server write app logs
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

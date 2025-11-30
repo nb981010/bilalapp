@@ -50,7 +50,7 @@ echo "Bilal installer running from: $APP_DIR"
 
 echo "Updating apt and installing system packages..."
 sudo apt-get update -y
-sudo apt-get install -y python3-venv python3-distutils nodejs npm sqlite3 curl
+sudo apt-get install -y python3-venv python3-distutils nodejs npm sqlite3 curl iproute2 psmisc
 
 echo "Preparing Python virtualenv at $VENV_DIR..."
 if [ ! -d "$VENV_DIR" ]; then
@@ -77,6 +77,13 @@ echo "Installing Python dependencies from requirements.txt into virtualenv..."
 pip install -r "$APP_DIR/requirements.txt"
 
 if [ $INSTALL_NODE -eq 1 ]; then
+  echo "Installing Node dependencies for frontend app..."
+  if [ -f "$APP_DIR/package.json" ]; then
+    (cd "$APP_DIR" && npm ci --no-audit --no-fund || npm install --no-audit --no-fund)
+  else
+    echo "Warning: No package.json found in app root. Skipping frontend dependencies."
+  fi
+
   echo "Installing Node dependencies for scripts helper (adhan)..."
   if [ -d "$APP_DIR/scripts" ] && [ -f "$APP_DIR/scripts/package.json" ]; then
     (cd "$APP_DIR/scripts" && npm ci --no-audit --no-fund || npm install --no-audit --no-fund)

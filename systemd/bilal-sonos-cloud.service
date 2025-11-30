@@ -1,0 +1,14 @@
+[Unit]
+Description=Bilal Sonos cloud microservice (sonos_cloud_service)
+After=network.target
+
+[Service]
+User=bilal
+Group=bilal
+WorkingDirectory=/opt/bilalapp/cloud
+ExecStart=/usr/bin/node /opt/bilalapp/cloud/sonos_cloud_service.cjs
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

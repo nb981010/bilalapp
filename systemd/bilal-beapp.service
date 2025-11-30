@@ -1,0 +1,16 @@
+[Unit]
+Description=Bilal Backend (beapp) Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/code/bilalapp
+# Use the project's virtualenv Python to run server.py
+ExecStart=/root/code/bilalapp/.venv/bin/python3 /root/code/bilalapp/server.py
+Restart=on-failure
+RestartSec=5
+Environment=BILAL_ENFORCE_SETTINGS_API=1
+
+[Install]
+WantedBy=multi-user.target

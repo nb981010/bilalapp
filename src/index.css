@@ -2,6 +2,6 @@
 @tailwind components;
 @tailwind utilities;
 
-/* You can add project global styles here. Example: */
+/* Global fallback styles (use raw CSS to avoid @apply compatibility issues) */
 html, body, #root { height: 100%; }
-body { @apply bg-slate-900 text-white font-sans; }
+body { background-color: #0f172a; color: #ffffff; font-family: Inter, sans-serif; }

@@ -8,6 +8,10 @@ export default defineConfig(({ mode }) => {
       server: {
         port: 3000,
         host: '0.0.0.0',
+        // Allow the local hostnames used in this environment (useful when accessing
+        // the dev server via the machine name `maxdev`). Add additional hosts as needed.
+        // Note: some environments or proxies may require adjusting this list.
+        allowedHosts: ['maxdev', 'localhost', '127.0.0.1']
       },
       plugins: [react()],
       define: {

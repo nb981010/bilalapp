@@ -11,7 +11,6 @@ import { INITIAL_ZONES } from './constants.ts';
 import { getPrayerTimes, getNextPrayer } from './services/prayerService.ts';
 import LogsViewer from './components/LogsViewer.tsx';
 import ZoneGrid from './components/ZoneGrid.tsx';
-import InstallScriptModal from './components/InstallScriptModal.tsx';
 import SettingsModal from './components/SettingsModal.tsx';
 import { 
   Clock, 
@@ -34,7 +33,6 @@ const App: React.FC = () => {
   const [zones, setZones] = useState<SonosZone[]>(INITIAL_ZONES);
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [showInstallModal, setShowInstallModal] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
 
   const [triggeredPrayers, setTriggeredPrayers] = useState<Set<string>>(new Set());
@@ -394,13 +392,6 @@ const App: React.FC = () => {
               <span className="text-sm font-medium">Test</span>
             </button>
             <button 
-              onClick={() => setShowInstallModal(true)}
-              className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-all text-slate-400 hover:text-white"
-              title="Install Script"
-            >
-              <Server size={18} />
-            </button>
-            <button 
               onClick={() => setShowSettings(true)}
               className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-all text-slate-400 hover:text-white"
               title="Settings"
@@ -473,12 +464,12 @@ const App: React.FC = () => {
                   </span>
                 </div>
                 <div className="flex justify-between items-center p-3 bg-black/20 rounded-lg">
-                   <span className="text-slate-300 text-sm">Audio Output</span>
-                   <span className="text-xs text-emerald-400 font-mono">Multi-Zone ({zones.length})</span>
+                   <span className="text-slate-300 text-sm">Backend Status</span>
+                   <span className="text-xs text-emerald-400 font-mono">Connected</span>
                 </div>
                 <div className="flex justify-between items-center p-3 bg-black/20 rounded-lg">
-                   <span className="text-slate-300 text-sm">Logic Strategy</span>
-                   <span className="text-xs text-slate-400 font-mono">Grouping (-60s)</span>
+                   <span className="text-slate-300 text-sm">Scheduler Status</span>
+                   <span className="text-xs text-emerald-400 font-mono">Active</span>
                 </div>
               </div>
            </div>
@@ -513,7 +504,6 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      <InstallScriptModal isOpen={showInstallModal} onClose={() => setShowInstallModal(false)} />
       <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} addLog={addLog} setZones={setZones} refreshSchedule={refreshSchedule} />
     </div>
   );

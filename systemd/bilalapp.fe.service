@@ -1,0 +1,20 @@
+[Unit]
+Description=Bilal Frontend Service (production static server)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/bilalapp
+# Build the frontend before starting the static server (runs as `bilal`)
+ExecStartPre=/usr/bin/npm run build --prefix /opt/bilalapp
+# Run the bundled Node static server directly (no npx) so the process runs as `bilal`.
+ExecStart=/usr/bin/node /opt/bilalapp/server-static.cjs
+Restart=on-failure
+RestartSec=5
+User=bilal
+Environment=NODE_ENV=production
+Environment=PORT=3000
+
+[Install]
+WantedBy=multi-user.target

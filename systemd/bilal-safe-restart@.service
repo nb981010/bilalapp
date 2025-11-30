@@ -1,0 +1,16 @@
+[Unit]
+Description=Bilal safe restart helper (instance=%i)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/code/bilalapp
+ExecStart=/root/code/bilalapp/scripts/safe_service_wrapper.sh %i
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target
+
+# Example usage:
+# sudo systemctl start bilal-safe-restart@"restart bilal-beapp.service 8000"

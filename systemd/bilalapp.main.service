@@ -1,0 +1,12 @@
+[Unit]
+Description=Bilal App Main Service (umbrella)
+After=network.target bilalapp.be.service bilalapp.fe.service
+Requires=bilalapp.be.service bilalapp.fe.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+
+[Install]
+WantedBy=multi-user.target

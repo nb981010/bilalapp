@@ -1,0 +1,15 @@
+[Unit]
+Description=Bilal Sonos local microservice (soco_server)
+After=network.target
+
+[Service]
+User=bilal
+Group=bilal
+WorkingDirectory=/opt/bilalapp
+ExecStart=/usr/bin/python3 /opt/bilalapp/local/soco_server.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
