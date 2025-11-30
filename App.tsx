@@ -12,6 +12,7 @@ import { getPrayerTimes, getNextPrayer } from './services/prayerService.ts';
 import LogsViewer from './components/LogsViewer.tsx';
 import ZoneGrid from './components/ZoneGrid.tsx';
 import InstallScriptModal from './components/InstallScriptModal.tsx';
+import SettingsModal from './components/SettingsModal.tsx';
 import { 
   Clock, 
   MapPin, 
@@ -20,6 +21,7 @@ import {
   VolumeX, 
   Sun, 
   Moon, 
+  Server,
   CloudRain
 } from 'lucide-react';
 import { format } from 'date-fns';
@@ -33,6 +35,7 @@ const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showInstallModal, setShowInstallModal] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   const [triggeredPrayers, setTriggeredPrayers] = useState<Set<string>>(new Set());
 
@@ -42,12 +45,85 @@ const App: React.FC = () => {
 
   // Fetch schedule on mount
   useEffect(() => {
-    const fetchSchedule = async () => {
-      const dailySchedule = await getPrayerTimes(new Date());
-      setSchedule(dailySchedule);
-      setNextPrayer(getNextPrayer(dailySchedule));
+    // Initial schedule fetch remains (fallback/calculation), but the Dashboard's
+    // "Today's Schedule" must show scheduler-calculated jobs. We'll poll
+    // the backend scheduler every 30s to keep the dashboard authoritative.
+    const init = async () => {
+      try {
+        const dailySchedule = await getPrayerTimes(new Date());
+        setSchedule(dailySchedule);
+        setNextPrayer(getNextPrayer(dailySchedule));
+      } catch (e) {
+        // ignore
+      }
     };
-    fetchSchedule();
+    init();
+  }, []);
+
+  // Polling: refresh zones and scheduler jobs every 30s so UI comes from DB
+  useEffect(() => {
+    let stopped = false;
+
+    const fetchZones = async () => {
+      try {
+        const res = await fetch('/api/zones');
+        if (!res.ok) throw new Error('zones fetch failed');
+        const data = await res.json();
+        if (Array.isArray(data) && data.length > 0) {
+          setZones(data);
+        } else {
+          // No zones discovered — show onboard audio as fallback (single virtual zone)
+          setZones([{ id: ZoneId.Zone1, name: 'Onboard Audio', isAvailable: true, status: 'idle', volume: 30 }]);
+        }
+      } catch (e:any) {
+        addLog('WARN', `Failed to refresh zones: ${e.message || e}`);
+        // keep previous zones if fetch fails
+      }
+    };
+
+    const fetchSchedulerJobs = async () => {
+      try {
+        const res = await fetch('/api/scheduler/jobs');
+        if (!res.ok) throw new Error('scheduler jobs fetch failed');
+        const data = await res.json();
+        if (data && Array.isArray(data.jobs)) {
+          // Map scheduler jobs to PrayerSchedule entries and filter today's jobs
+          const todayStr = new Date().toISOString().slice(0,10);
+          const mapped = data.jobs
+            .map((j:any) => {
+              // job id format: azan-YYYY-MM-DD-<prayer>
+              const parts = (j.id || '').split('-');
+              const prayerKey = parts.slice(3).join('-') || '';
+              const name = (prayerKey.charAt(0).toUpperCase() + prayerKey.slice(1)) as any;
+              const time = j.next_run_time ? new Date(j.next_run_time) : null;
+              return time ? { name, time, isNext: false } : null;
+            })
+            .filter(Boolean) as any[];
+
+          // Filter jobs for today only
+          const todayJobs = mapped.filter(ms => ms.time.toISOString().slice(0,10) === todayStr);
+          // Sort by time
+          todayJobs.sort((a:any,b:any) => a.time.getTime() - b.time.getTime());
+          setSchedule(todayJobs);
+          setNextPrayer(getNextPrayer(todayJobs));
+        }
+      } catch (e:any) {
+        addLog('WARN', `Failed to refresh scheduler jobs: ${e.message || e}`);
+      }
+    };
+
+    // Initial run
+    fetchZones();
+    fetchSchedulerJobs();
+
+    const id = setInterval(() => {
+      if (stopped) return;
+      fetchZones();
+      fetchSchedulerJobs();
+    }, 30_000);
+
+    return () => { stopped = true; clearInterval(id); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   
   // Helper to add logs
@@ -209,6 +285,17 @@ const App: React.FC = () => {
     };
   }, []);
 
+  const refreshSchedule = async () => {
+    try {
+      const dailySchedule = await getPrayerTimes(new Date());
+      setSchedule(dailySchedule);
+      setNextPrayer(getNextPrayer(dailySchedule));
+      addLog('INFO', 'Prayer schedule refreshed');
+    } catch (e:any) {
+      addLog('ERROR', `Failed to refresh schedule: ${e.message || e}`);
+    }
+  };
+
   // Cleanup Logic
   const finishAzan = () => {
     setAppState(AppState.RESTORING);
@@ -289,7 +376,7 @@ const App: React.FC = () => {
             </div>
         </div>
 
-        <div className="flex gap-3">
+            <div className="flex gap-3">
             <button 
               onClick={handleManualTest}
               disabled={appState !== AppState.IDLE}
@@ -301,7 +388,14 @@ const App: React.FC = () => {
             <button 
               onClick={() => setShowInstallModal(true)}
               className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-all text-slate-400 hover:text-white"
-              title="Installation Script"
+              title="Install Script"
+            >
+              <Server size={18} />
+            </button>
+            <button 
+              onClick={() => setShowSettings(true)}
+              className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-all text-slate-400 hover:text-white"
+              title="Settings"
             >
               <Settings size={20} />
             </button>
@@ -313,6 +407,43 @@ const App: React.FC = () => {
         
         {/* Left Column: Schedule & Status (4 cols) */}
         <div className="lg:col-span-4 space-y-6">
+           {/* Prayer Timeline (scheduler-sourced) */}
+           <div className="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-lg">
+              <h2 className="text-slate-200 font-semibold mb-4 flex items-center gap-2">
+                <CloudRain size={18} className="text-blue-400" /> Today's Schedule
+              </h2>
+              <div className="space-y-1">
+                {schedule.map((prayer) => {
+                  const isPast = prayer.time < currentTime;
+                  const isNext = nextPrayer?.name === prayer.name;
+                  
+                  return (
+                    <div 
+                      key={prayer.name + String(prayer.time)}
+                      className={`
+                        flex justify-between items-center p-3 rounded-lg transition-colors
+                        ${isNext ? 'bg-emerald-900/30 border border-emerald-500/30' : 'hover:bg-slate-800/50'}
+                        ${isPast ? 'opacity-50' : 'opacity-100'}
+                      `}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className={`w-2 h-2 rounded-full ${
+                          isNext ? 'bg-emerald-400 animate-pulse' : 
+                          isPast ? 'bg-slate-600' : 'bg-slate-400'
+                        }`} />
+                        <span className={`text-sm font-medium ${isNext ? 'text-emerald-300' : 'text-slate-300'}`}>
+                          {prayer.name}
+                        </span>
+                      </div>
+                      <span className="font-mono text-sm text-slate-400">
+                        {format(prayer.time, 'HH:mm')}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+           </div>
+
            {/* Current Status Card */}
            <div className="bg-gradient-to-br from-emerald-900 to-slate-900 rounded-2xl p-6 border border-emerald-800/30 shadow-2xl relative overflow-hidden">
               <div className="absolute top-0 right-0 p-4 opacity-10">
@@ -335,49 +466,12 @@ const App: React.FC = () => {
                 </div>
                 <div className="flex justify-between items-center p-3 bg-black/20 rounded-lg">
                    <span className="text-slate-300 text-sm">Audio Output</span>
-                   <span className="text-xs text-emerald-400 font-mono">Multi-Zone (7)</span>
+                   <span className="text-xs text-emerald-400 font-mono">Multi-Zone ({zones.length})</span>
                 </div>
                 <div className="flex justify-between items-center p-3 bg-black/20 rounded-lg">
                    <span className="text-slate-300 text-sm">Logic Strategy</span>
                    <span className="text-xs text-slate-400 font-mono">Grouping (-60s)</span>
                 </div>
-              </div>
-           </div>
-
-           {/* Prayer Timeline */}
-           <div className="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-lg">
-              <h2 className="text-slate-200 font-semibold mb-4 flex items-center gap-2">
-                <CloudRain size={18} className="text-blue-400" /> Today's Schedule
-              </h2>
-              <div className="space-y-1">
-                {schedule.map((prayer) => {
-                  const isPast = prayer.time < currentTime;
-                  const isNext = nextPrayer?.name === prayer.name;
-                  
-                  return (
-                    <div 
-                      key={prayer.name}
-                      className={`
-                        flex justify-between items-center p-3 rounded-lg transition-colors
-                        ${isNext ? 'bg-emerald-900/30 border border-emerald-500/30' : 'hover:bg-slate-800/50'}
-                        ${isPast ? 'opacity-50' : 'opacity-100'}
-                      `}
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className={`w-2 h-2 rounded-full ${
-                          isNext ? 'bg-emerald-400 animate-pulse' : 
-                          isPast ? 'bg-slate-600' : 'bg-slate-400'
-                        }`} />
-                        <span className={`text-sm font-medium ${isNext ? 'text-emerald-300' : 'text-slate-300'}`}>
-                          {prayer.name}
-                        </span>
-                      </div>
-                      <span className="font-mono text-sm text-slate-400">
-                        {format(prayer.time, 'HH:mm')}
-                      </span>
-                    </div>
-                  );
-                })}
               </div>
            </div>
         </div>
@@ -412,6 +506,7 @@ const App: React.FC = () => {
       </main>
 
       <InstallScriptModal isOpen={showInstallModal} onClose={() => setShowInstallModal(false)} />
+      <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} addLog={addLog} setZones={setZones} refreshSchedule={refreshSchedule} />
     </div>
   );
 };
