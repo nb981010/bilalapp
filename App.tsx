@@ -90,15 +90,23 @@ const App: React.FC = () => {
           // Map scheduler jobs to PrayerSchedule entries and filter today's jobs
           const todayStr = new Date().toISOString().slice(0,10);
           const mapped = data.jobs
-            .map((j:any) => {
-              // job id format: azan-YYYY-MM-DD-<prayer>
-              const parts = (j.id || '').split('-');
-              const prayerKey = parts.slice(3).join('-') || '';
-              const name = (prayerKey.charAt(0).toUpperCase() + prayerKey.slice(1)) as any;
-              const time = j.next_run_time ? new Date(j.next_run_time) : null;
-              return time ? { name, time, isNext: false } : null;
-            })
-            .filter(Boolean) as any[];
+              .map((j:any) => {
+                // job id format: azan-YYYY-MM-DD-<prayer>
+                const parts = (j.id || '').split('-');
+                const prayerKey = (parts[3] || '').toLowerCase();
+                const PRAYER_KEY_MAP: Record<string,string> = {
+                  'fajr': 'Fajr',
+                  'dhuhr': 'Dhuhr',
+                  'asr': 'Asr',
+                  'maghrib': 'Maghrib',
+                  'isha': 'Isha'
+                };
+                if (!PRAYER_KEY_MAP[prayerKey]) return null; // ignore sunrise/sunset/unknown jobs
+                const name = PRAYER_KEY_MAP[prayerKey] as any;
+                const time = j.next_run_time ? new Date(j.next_run_time) : null;
+                return time ? { name, time, isNext: false } : null;
+              })
+              .filter(Boolean) as any[];
 
           // Filter jobs for today only
           const todayJobs = mapped.filter(ms => ms.time.toISOString().slice(0,10) === todayStr);

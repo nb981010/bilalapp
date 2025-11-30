@@ -4,6 +4,7 @@ import { PrayerName, PrayerSchedule } from '../types.ts';
 
 const toSchedule = (raw: any): PrayerSchedule[] => {
   // raw times are strings "HH:MM"; convert to Date objects for today
+  // Exclude Sunrise and any non-prayer sunrise/sunset entries from the schedule
   const today = new Date();
   const dateStr = raw?.date || today.toISOString().slice(0,10);
   const [y, m, d] = dateStr.split('-').map((s: string) => parseInt(s, 10));
@@ -14,7 +15,6 @@ const toSchedule = (raw: any): PrayerSchedule[] => {
   };
   return [
     { name: PrayerName.Fajr, time: mk(raw.fajr), isNext: false },
-    { name: PrayerName.Sunrise, time: mk(raw.sunrise), isNext: false },
     { name: PrayerName.Dhuhr, time: mk(raw.dhuhr), isNext: false },
     { name: PrayerName.Asr, time: mk(raw.asr), isNext: false },
     { name: PrayerName.Maghrib, time: mk(raw.maghrib), isNext: false },
@@ -34,16 +34,45 @@ export const getPrayerTimes = async (date: Date): Promise<PrayerSchedule[]> => {
   } catch (e) {
     // ignore and fallback to local
   }
+  // Fallback to local adhan computation but prefer server-side settings
+  let lat = DUBAI_COORDS.latitude;
+  let lon = DUBAI_COORDS.longitude;
+  let calcMethod = 'Dubai';
+  let asrMadhab = 'Shafi';
+  try {
+    const sres = await fetch('/api/settings');
+    if (sres.ok) {
+      const s = await sres.json();
+      if (s.prayer_lat) lat = parseFloat(String(s.prayer_lat)) || lat;
+      if (s.prayer_lon) lon = parseFloat(String(s.prayer_lon)) || lon;
+      if (s.calc_method) calcMethod = String(s.calc_method) || calcMethod;
+      if (s.asr_madhab) asrMadhab = String(s.asr_madhab) || asrMadhab;
+    }
+  } catch (e) {
+    // ignore and fall back to defaults
+  }
 
-  // Fallback to local adhan computation
-  const coords = new Coordinates(DUBAI_COORDS.latitude, DUBAI_COORDS.longitude);
-  const dubaiParams = CalculationMethod.Dubai();
-  const params = Object.assign(Object.create(Object.getPrototypeOf(dubaiParams)), dubaiParams);
-  params.madhab = Madhab.Shafi;
+  const coords = new Coordinates(lat, lon);
+  // Calculation method and madhab
+  let methodParams: any;
+  try {
+    if (calcMethod === 'Dubai') methodParams = CalculationMethod.Dubai();
+    else if (calcMethod === 'ISNA') methodParams = CalculationMethod.ISNA();
+    else if (calcMethod === 'Makkah') methodParams = CalculationMethod.Makkah();
+    else if (calcMethod === 'Egypt') methodParams = CalculationMethod.Egypt();
+    else methodParams = CalculationMethod.Dubai();
+  } catch (e) {
+    methodParams = CalculationMethod.Dubai();
+  }
+  const params = Object.assign(Object.create(Object.getPrototypeOf(methodParams)), methodParams);
+  try {
+    params.madhab = asrMadhab === 'Hanafi' ? Madhab.Hanafi : Madhab.Shafi;
+  } catch (e) {
+    params.madhab = Madhab.Shafi;
+  }
   const prayerTimes = new PrayerTimes(coords, date, params);
   return [
     { name: PrayerName.Fajr, time: prayerTimes.fajr, isNext: false },
-    { name: PrayerName.Sunrise, time: prayerTimes.sunrise, isNext: false },
     { name: PrayerName.Dhuhr, time: prayerTimes.dhuhr, isNext: false },
     { name: PrayerName.Asr, time: prayerTimes.asr, isNext: false },
     { name: PrayerName.Maghrib, time: prayerTimes.maghrib, isNext: false },
