@@ -8,6 +8,7 @@ import json
 import subprocess
 from datetime import datetime, date, timedelta
 from flask import Flask, send_from_directory, jsonify, request
+from werkzeug.utils import secure_filename
 import requests
 from subprocess import PIPE, Popen
 from zoneinfo import ZoneInfo
@@ -458,6 +459,15 @@ def init_db(db_path=None):
                 value TEXT
             )
         ''')
+        # Audio metadata table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS audio_files (
+                filename TEXT PRIMARY KEY,
+                qari_name TEXT,
+                uploaded_by TEXT,
+                uploaded_at TEXT
+            )
+        ''')
         conn.commit()
         conn.close()
     except Exception as e:
@@ -657,6 +667,97 @@ def schedule_prayers_for_date(target_date: date):
     except Exception as e:
         logger.error(f"Failed to schedule prayers for {target_date}: {e}")
     return scheduled_count
+def compute_prayer_jobs_for_date(settings: dict, target_date: date):
+    """Compute prayer job objects for a given date using provided settings.
+
+    This is a pure function: it returns a list of job dicts and does NOT
+    schedule them into APScheduler or call any Sonos/cloud playback.
+    Returned job objects have keys: id, prayer, scheduled_local, scheduled_utc, playback_file
+    """
+    jobs = []
+    try:
+        tz = get_prayer_tz()
+        # Determine coordinates from provided settings or environment
+        try:
+            lat = float(settings.get('prayer_lat') or os.environ.get('PRAYER_LAT', '25.2048'))
+            lon = float(settings.get('prayer_lon') or os.environ.get('PRAYER_LON', '55.2708'))
+        except Exception:
+            lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
+            lon = float(os.environ.get('PRAYER_LON', '55.2708'))
+
+        # Try node helper first
+        times = None
+        try:
+            script = os.path.join(os.path.dirname(__file__), 'scripts', 'compute_prayer_times.mjs')
+            if os.path.exists(script):
+                cmd = ['node', script, target_date.isoformat()]
+                env = os.environ.copy()
+                env['TZ'] = 'Asia/Dubai'
+                p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True, env=env)
+                out, err = p.communicate(timeout=5)
+                if p.returncode == 0 and out:
+                    try:
+                        node_data = json.loads(out)
+                        times = {
+                            'fajr': node_data.get('fajr'),
+                            'sunrise': node_data.get('sunrise'),
+                            'dhuhr': node_data.get('dhuhr'),
+                            'asr': node_data.get('asr'),
+                            'maghrib': node_data.get('maghrib'),
+                            'isha': node_data.get('isha')
+                        }
+                    except Exception:
+                        logger.warning(f"Node helper returned invalid JSON for prayertimes: {out}")
+                else:
+                    logger.debug(f"Node helper failed for prayertimes: rc={p.returncode} err={err}")
+        except Exception as e:
+            logger.debug(f"Failed to run node helper for prayer schedule: {e}")
+
+        # Fallback to Python praytimes if node helper did not produce times
+        if times is None:
+            try:
+                pt = praytimes.PrayTimes()
+                local_dt = datetime(target_date.year, target_date.month, target_date.day, tzinfo=tz)
+                offset_td = local_dt.utcoffset() or timedelta(0)
+                tz_offset_hours = offset_td.total_seconds() / 3600.0
+            except Exception:
+                tz_offset_hours = 0
+            times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz_offset_hours)
+
+        prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
+        for key in prayer_keys:
+            tstr = times.get(key)
+            if not tstr:
+                continue
+            parts = tstr.split(':')
+            hour = int(parts[0])
+            minute = int(parts[1])
+            try:
+                scheduled_dt = datetime(target_date.year, target_date.month, target_date.day, hour, minute, tzinfo=tz)
+            except Exception:
+                scheduled_dt = datetime(target_date.year, target_date.month, target_date.day, hour, minute)
+
+            try:
+                scheduled_local = scheduled_dt.isoformat()
+            except Exception:
+                scheduled_local = str(scheduled_dt)
+            try:
+                scheduled_utc = scheduled_dt.astimezone(ZoneInfo('UTC')).isoformat()
+            except Exception:
+                scheduled_utc = scheduled_local
+
+            job_id = f"azan-{target_date.isoformat()}-{key}"
+            filename = 'fajr.mp3' if key == 'fajr' else 'azan.mp3'
+            jobs.append({
+                'id': job_id,
+                'prayer': key,
+                'scheduled_local': scheduled_local,
+                'scheduled_utc': scheduled_utc,
+                'playback_file': filename
+            })
+    except Exception as e:
+        logger.warning(f"compute_prayer_jobs_for_date failed: {e}")
+    return jobs
 def schedule_today_and_rescheduler():
     """Schedule today's prayers and a daily rescheduler at 00:05 local time."""
     if not SCHEDULER_AVAILABLE:
@@ -759,6 +860,58 @@ def api_force_schedule_today():
         return jsonify({'available': True, 'jobs_added': added})
     except Exception as e:
         return jsonify({'available': False, 'error': str(e)}), 500
+
+
+@app.route('/api/scheduler/compute', methods=['POST'])
+def api_scheduler_compute():
+    """Compute prayer jobs for a given date without scheduling them.
+
+    Accepts JSON: {"mode": "test"|"production", "date": "YYYY-MM-DD"}
+    Date is restricted to today or tomorrow only. When mode is 'test', test_settings
+    are used; when 'production', production settings are used and a passcode header
+    may be required if `BILAL_ENFORCE_SETTINGS_API` is enabled.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        mode = (data.get('mode') or 'test').lower()
+        date_str = data.get('date')
+        if not date_str:
+            return jsonify({'status': 'error', 'message': 'missing date'}), 400
+        try:
+            tgt = datetime.fromisoformat(date_str).date()
+        except Exception:
+            return jsonify({'status': 'error', 'message': 'invalid date format, use YYYY-MM-DD'}), 400
+
+        tz = get_prayer_tz()
+        try:
+            today = datetime.now(tz).date() if tz is not None else date.today()
+        except Exception:
+            today = date.today()
+        if tgt not in (today, today + timedelta(days=1)):
+            return jsonify({'status': 'error', 'message': 'date must be today or tomorrow only'}), 400
+
+        if mode == 'test':
+            settings = _read_settings_table(test=True)
+        else:
+            # production mode: enforce passcode header if configured
+            enforce = os.environ.get('BILAL_ENFORCE_SETTINGS_API', '')
+            if str(enforce).lower() in ('1', 'true', 'yes'):
+                received = request.headers.get('X-BILAL-PASSCODE', '')
+                try:
+                    prod_settings = _read_settings_table(test=False)
+                    stored_pass = prod_settings.get('passcode', '1234')
+                except Exception:
+                    stored_pass = '1234'
+                if not received or str(received) != str(stored_pass):
+                    logger.warning('Forbidden scheduler compute: missing/invalid X-BILAL-PASSCODE')
+                    return jsonify({'status': 'error', 'message': 'forbidden: invalid passcode header'}), 403
+            settings = _read_settings_table(test=False)
+
+        jobs = compute_prayer_jobs_for_date(settings, tgt)
+        return jsonify({'status': 'ok', 'jobs': jobs})
+    except Exception as e:
+        logger.error(f"api_scheduler_compute error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/api/scheduler/simulate-play', methods=['POST'])
@@ -919,6 +1072,125 @@ def api_test_settings():
             return jsonify({'status': 'ok'})
     except Exception as e:
         logger.error(f"api_test_settings error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/audio/list', methods=['GET'])
+def api_audio_list():
+    """Return list of available audio files and metadata."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT filename, qari_name, uploaded_by, uploaded_at FROM audio_files')
+        rows = c.fetchall()
+        conn.close()
+        items = []
+        for fn, qari, by, at in rows:
+            # Ensure file actually exists on disk
+            if not os.path.exists(os.path.join('audio', fn)):
+                continue
+            items.append({'filename': fn, 'qari_name': qari, 'uploaded_by': by, 'uploaded_at': at, 'url': f"/audio/{fn}"})
+        return jsonify({'status': 'ok', 'files': items})
+    except Exception as e:
+        logger.error(f"api_audio_list error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/audio/upload', methods=['POST'])
+def api_audio_upload():
+    """Upload an audio file and save metadata. Requires passcode header when enforced."""
+    try:
+        # Enforce passcode if configured
+        enforce = os.environ.get('BILAL_ENFORCE_SETTINGS_API', '')
+        if str(enforce).lower() in ('1', 'true', 'yes'):
+            received = request.headers.get('X-BILAL-PASSCODE', '')
+            try:
+                settings = _read_settings_table(test=False)
+                stored_pass = settings.get('passcode', '1234')
+            except Exception:
+                stored_pass = '1234'
+            if not received or str(received) != str(stored_pass):
+                logger.warning('Forbidden audio upload: missing/invalid X-BILAL-PASSCODE')
+                return jsonify({'status': 'error', 'message': 'forbidden: invalid passcode header'}), 403
+
+        if 'file' not in request.files:
+            return jsonify({'status': 'error', 'message': 'no file part'}), 400
+        file = request.files['file']
+        qari_name = (request.form.get('qari_name') or '').strip()
+        if file.filename == '':
+            return jsonify({'status': 'error', 'message': 'no selected file'}), 400
+        # Basic size check (10 MB)
+        try:
+            max_size = int(os.environ.get('BILAL_AUDIO_MAX_BYTES', 10 * 1024 * 1024))
+            if request.content_length and request.content_length > max_size:
+                return jsonify({'status': 'error', 'message': 'file too large'}), 400
+        except Exception:
+            pass
+        # Validate mimetype
+        mimetype = file.mimetype or ''
+        if not mimetype.startswith('audio') and not file.filename.lower().endswith(('.mp3', '.wav', '.ogg')):
+            return jsonify({'status': 'error', 'message': 'invalid audio file type'}), 400
+
+        safe_name = secure_filename(file.filename)
+        ts = int(time.time())
+        stored_name = f"{ts}_{safe_name}"
+        os.makedirs('audio', exist_ok=True)
+        dest_path = os.path.join('audio', stored_name)
+        file.save(dest_path)
+
+        # Persist metadata
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute('INSERT OR REPLACE INTO audio_files (filename, qari_name, uploaded_by, uploaded_at) VALUES (?, ?, ?, ?)', (stored_name, qari_name, request.remote_addr, datetime.now(get_prayer_tz() or ZoneInfo('UTC')).isoformat()))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to persist audio metadata: {e}")
+        return jsonify({'status': 'ok', 'filename': stored_name, 'url': f"/audio/{stored_name}"})
+    except Exception as e:
+        logger.error(f"api_audio_upload error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/audio/<path:filename>', methods=['DELETE'])
+def api_audio_delete(filename):
+    """Delete an uploaded audio file and its metadata (admin action)."""
+    try:
+        # Require passcode header for deletion
+        enforce = os.environ.get('BILAL_ENFORCE_SETTINGS_API', '')
+        if str(enforce).lower() in ('1', 'true', 'yes'):
+            received = request.headers.get('X-BILAL-PASSCODE', '')
+            try:
+                settings = _read_settings_table(test=False)
+                stored_pass = settings.get('passcode', '1234')
+            except Exception:
+                stored_pass = '1234'
+            if not received or str(received) != str(stored_pass):
+                logger.warning('Forbidden audio delete: missing/invalid X-BILAL-PASSCODE')
+                return jsonify({'status': 'error', 'message': 'forbidden: invalid passcode header'}), 403
+
+        # Sanitize path to filename
+        safe = secure_filename(filename)
+        path = os.path.join('audio', safe)
+        if not os.path.exists(path):
+            return jsonify({'status': 'error', 'message': 'file not found'}), 404
+        try:
+            os.remove(path)
+        except Exception as e:
+            logger.warning(f"Failed to remove file {path}: {e}")
+            return jsonify({'status': 'error', 'message': 'failed to remove file'}), 500
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute('DELETE FROM audio_files WHERE filename=?', (safe,))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Failed to remove audio metadata for {safe}: {e}")
+        return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"api_audio_delete error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 

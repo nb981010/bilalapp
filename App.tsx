@@ -11,7 +11,8 @@ import { INITIAL_ZONES } from './constants.ts';
 import { getPrayerTimes, getNextPrayer } from './services/prayerService.ts';
 import LogsViewer from './components/LogsViewer.tsx';
 import ZoneGrid from './components/ZoneGrid.tsx';
-import SettingsModal from './components/SettingsModal.tsx';
+import SettingsTab from './components/SettingsTab.tsx';
+import TestTab from './components/TestTab.tsx';
 import { 
   Clock, 
   MapPin, 
@@ -20,6 +21,7 @@ import {
   VolumeX, 
   Sun, 
   Moon, 
+  Zap,
   Server,
   CloudRain
 } from 'lucide-react';
@@ -34,6 +36,7 @@ const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [showSettings, setShowSettings] = useState(false);
+  const [activeTab, setActiveTab] = useState<'dashboard'|'settings'|'test'>('dashboard');
 
   const [triggeredPrayers, setTriggeredPrayers] = useState<Set<string>>(new Set());
 
@@ -392,14 +395,42 @@ const App: React.FC = () => {
               <span className="text-sm font-medium">Test</span>
             </button>
             <button 
-              onClick={() => setShowSettings(true)}
+              onClick={() => setActiveTab('settings')}
               className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-all text-slate-400 hover:text-white"
               title="Settings"
             >
               <Settings size={20} />
             </button>
+            <button 
+              onClick={() => setActiveTab('test')}
+              className="p-2 bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-all text-slate-400 hover:text-white"
+              title="Test Tab"
+            >
+              <Zap size={20} />
+            </button>
         </div>
       </header>
+
+      {/* Tab Panels */}
+      {activeTab !== 'dashboard' && (
+        <div className="max-w-7xl mx-auto mb-6">
+          <div className="bg-slate-900 rounded-2xl p-4 border border-slate-800">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-3">
+                <button onClick={() => setActiveTab('dashboard')} className="px-3 py-1 bg-slate-800 rounded">Back</button>
+                <h3 className="text-lg font-semibold">{activeTab === 'settings' ? 'Settings' : 'Test'}</h3>
+              </div>
+            </div>
+            <div>
+              {activeTab === 'settings' ? (
+                <SettingsTab addLog={addLog} refreshSchedule={refreshSchedule} />
+              ) : (
+                <TestTab addLog={addLog} />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Main Grid */}
       <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">

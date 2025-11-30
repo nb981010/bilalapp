@@ -19,6 +19,34 @@ View your app in AI Studio: https://ai.studio/apps/drive/1h2MqFMXz1PFufOfwJTaOQW
 3. Run the app:
    `npm run dev`
 
+## New Audio & Test Endpoints
+
+The project now includes endpoints to upload/list audio and compute test schedules without affecting production jobs.
+
+### Audio endpoints
+
+- `GET /api/audio/list` — returns uploaded audio files and metadata: `{ status, files: [{filename,qari_name,uploaded_by,uploaded_at,url}] }`
+- `POST /api/audio/upload` — multipart form with `file` and `qari_name`. Requires `X-BILAL-PASSCODE` header when `BILAL_ENFORCE_SETTINGS_API` is enabled. Returns `{ status, filename, url }`.
+- `DELETE /api/audio/<filename>` — deletes uploaded file and metadata (admin). Requires passcode when enforced.
+
+### Scheduler compute & test endpoints
+
+- `POST /api/scheduler/compute` — compute-only scheduler preview. JSON payload: `{ "mode": "test"|"production", "date": "YYYY-MM-DD" }`. Returns `{ status: 'ok', jobs: [...] }`. Date is restricted to today or tomorrow. Production mode requires passcode header when `BILAL_ENFORCE_SETTINGS_API` is enabled.
+- `POST /api/test/play` — append a simulated play entry (safe testing; does not control Sonos).
+- `POST /api/scheduler/simulate-play` — append simulated play-history entry for scheduler logic.
+
+### Migration helper
+
+A simple migration helper to create the `audio_files` table is provided at `scripts/create_audio_table.py`. It will create the table in the same DB path used by the server (`BILAL_DB_PATH` or `bilal_jobs.sqlite`):
+
+```bash
+python3 scripts/create_audio_table.py
+```
+
+Notes:
+- Uploaded audio files are stored under the `audio/` directory and served at `/audio/<filename>`.
+- File uploads accept common audio types (`.mp3`, `.wav`, `.ogg`) and are limited to 10MB by default (configurable via `BILAL_AUDIO_MAX_BYTES`).
+
 ## Azan Playback Behavior
 
 - The server enforces a single-attempt policy for automatic Azan playback: when `/api/play` is called for a scheduled Azan, the server will try to start playback once and verify it started. If the start fails, it will return an error and will not retry automatically.
