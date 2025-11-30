@@ -1,0 +1,7 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* You can add project global styles here. Example: */
+html, body, #root { height: 100%; }
+body { @apply bg-slate-900 text-white font-sans; }
