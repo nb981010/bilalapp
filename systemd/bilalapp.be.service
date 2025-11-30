@@ -1,0 +1,15 @@
+[Unit]
+Description=Bilal Backend Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/code/bilalapp
+ExecStart=/root/code/bilalapp/.venv/bin/python3 /root/code/bilalapp/server.py
+Restart=on-failure
+RestartSec=5
+User=bilal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

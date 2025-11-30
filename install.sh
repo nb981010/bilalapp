@@ -102,6 +102,10 @@ if [ ! -f "$DB_PATH" ]; then
 fi
 chmod 664 "$DB_PATH" || true
 
+echo "Ensuring default production passcode is set (default: 2234)..."
+# Insert passcode only if missing; do not overwrite an existing passcode.
+sqlite3 "$DB_PATH" "INSERT INTO settings (key, value) SELECT 'passcode','2234' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='passcode');" || true
+
 if [ $INSTALL_SERVICE -eq 1 ]; then
   echo "Creating systemd unit at $SERVICE_PATH (requires sudo)"
   # Write an env file that the unit will consume (preserve if exists unless forced)
