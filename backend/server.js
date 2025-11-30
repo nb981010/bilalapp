@@ -2,10 +2,10 @@
 // Node Express backend that prefers Sonos Cloud control and falls back to a local
 // SoCo microservice when cloud actions are unavailable or fail.
 
-const express = require('express');
-const fetch = require('node-fetch');
-const bodyParser = require('body-parser');
-const cloud = require('../cloud/sonosCloudClient');
+import express from 'express';
+import fetch from 'node-fetch';
+import bodyParser from 'body-parser';
+import * as cloud from '../cloud/sonosCloudClient.js';
 
 const LOCAL_BASE = process.env.LOCAL_SONO_BASE || 'http://127.0.0.1:5001';
 const PORT = process.env.SONOS_NODE_PORT || 3001;

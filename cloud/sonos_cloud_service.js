@@ -15,11 +15,14 @@
   Note: this is a convenience shim; adapt Sonos Cloud API endpoints as needed.
 */
 
-const express = require('express');
-const fetch = global.fetch || require('node-fetch');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
-const { URLSearchParams } = require('url');
+import express from 'express';
+import fetch from 'node-fetch';
+import sqlite3pkg from 'sqlite3';
+import path from 'path';
+import { URLSearchParams } from 'url';
+
+const sqlite3 = sqlite3pkg.verbose();
+const __dirname = path.dirname(new URL(import.meta.url).pathname);
 
 const APP_DIR = path.join(__dirname, '..');
 const DB_PATH = process.env.BILAL_DB_PATH || path.join(APP_DIR, 'bilal_jobs.sqlite');
