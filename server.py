@@ -8,9 +8,11 @@ import json
 import subprocess
 from datetime import datetime, date, timedelta
 from flask import Flask, send_from_directory, jsonify, request
+import requests
 from subprocess import PIPE, Popen
 from zoneinfo import ZoneInfo
 import sqlite3
+import sys
 
 # Optional scheduler/prayer time imports (installed by install.sh)
 try:
@@ -29,6 +31,12 @@ try:
         SQLALCHEMY_AVAILABLE = False
 except Exception:
     SCHEDULER_AVAILABLE = False
+    SCHEDULER_IMPORT_ERROR = None
+    try:
+        import traceback
+        SCHEDULER_IMPORT_ERROR = traceback.format_exc()
+    except Exception:
+        SCHEDULER_IMPORT_ERROR = 'Unknown import error for scheduler-related packages'
 
 # Path to SQLite DB (used for APScheduler jobstore and play history)
 DB_PATH = os.environ.get('BILAL_DB_PATH', 'bilal_jobs.sqlite')
@@ -67,6 +75,17 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("BilalServer")
+
+# Ensure this script is importable as module name 'server' when executed as __main__.
+# APScheduler textual job references require the module path to be importable; when
+# running the script directly (`python server.py`) its module name is '__main__',
+# so register it under 'server' in sys.modules so textual references like
+# 'server._http_post_play' resolve correctly.
+if __name__ == '__main__':
+    try:
+        sys.modules['server'] = sys.modules['__main__']
+    except Exception:
+        pass
 
 # Safely handle any stale process on port 5000, but only once per host boot/service install.
 # Create a lightweight marker file in /tmp to avoid repeated kills during rapid restarts.
@@ -135,26 +154,25 @@ def get_local_ip():
         return "127.0.0.1"
 
 def get_sonos_speakers():
-    """Discover and return Sonos speakers."""
+    """Discover and return Sonos speakers with fast timeout."""
     logger.info("Starting Sonos speaker discovery")
     try:
         import soco
     except ImportError:
         logger.error("SoCo library not found.")
         return []
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            logger.debug(f"Discovery attempt {attempt+1}/{max_retries}")
-            zones = list(soco.discover(timeout=5) or [])
-            if zones:
-                logger.info(f"Discovered {len(zones)} Sonos speakers: {[z.player_name for z in zones]}")
-                return zones
-            else:
-                logger.warning(f"No Sonos speakers found (attempt {attempt+1}/{max_retries})")
-        except Exception as e:
-            logger.error(f"Error during Sonos discovery (attempt {attempt+1}): {e}")
-    logger.error("Failed to discover any Sonos speakers after all retries")
+    # Use single attempt with 2-second timeout to avoid slow API responses
+    try:
+        logger.debug("Discovery attempt (2s timeout)")
+        zones = list(soco.discover(timeout=2) or [])
+        if zones:
+            logger.info(f"Discovered {len(zones)} Sonos speakers: {[z.player_name for z in zones]}")
+            return zones
+        else:
+            logger.warning("No Sonos speakers found")
+    except Exception as e:
+        logger.error(f"Error during Sonos discovery: {e}")
+    logger.info("No Sonos speakers discovered, returning empty list")
     return []
 
 
@@ -235,7 +253,10 @@ def api_prayer_times():
             cmd = ['node', script]
             if date_q:
                 cmd.append(date_q)
-            p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True)
+            # Set TZ environment variable to Asia/Dubai for the subprocess
+            env = os.environ.copy()
+            env['TZ'] = 'Asia/Dubai'
+            p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True, env=env)
             out, err = p.communicate(timeout=5)
             if p.returncode == 0 and out:
                 try:
@@ -249,14 +270,24 @@ def api_prayer_times():
 
     # Fallback to existing praytimes calculation
     try:
-        tgt = date.today()
+        tz = get_prayer_tz()
+        try:
+            tgt = datetime.now(tz).date() if tz is not None else date.today()
+        except Exception:
+            tgt = date.today()
         if date_q:
             try:
                 tgt = datetime.fromisoformat(date_q).date()
             except Exception:
                 pass
-        lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
-        lon = float(os.environ.get('PRAYER_LON', '55.2708'))
+        # Prefer DB-configured settings if present
+        try:
+            s = _read_settings_table(test=False)
+            lat = float(s.get('prayer_lat') or os.environ.get('PRAYER_LAT', '25.2048'))
+            lon = float(s.get('prayer_lon') or os.environ.get('PRAYER_LON', '55.2708'))
+        except Exception:
+            lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
+            lon = float(os.environ.get('PRAYER_LON', '55.2708'))
         tz = get_prayer_tz()
         pt = praytimes.PrayTimes()
         try:
@@ -279,6 +310,72 @@ scheduler = None
 # Track missed-scheduler attempts per date so we can adapt retry cadence.
 MISSED_SCHED_ATTEMPTS = {}
 
+
+def _reschedule_daily_job():
+    """Module-level wrapper used by APScheduler jobstore (textual reference).
+
+    This function calls schedule_prayers_for_date for the current day. Using a
+    textual reference ("server._reschedule_daily_job") avoids serialization
+    warnings when using persistent jobstores.
+    """
+    try:
+        tz = get_prayer_tz()
+        try:
+            cur = datetime.now(tz).date() if tz is not None else date.today()
+        except Exception:
+            cur = date.today()
+        schedule_prayers_for_date(cur)
+    except Exception as e:
+        logger.warning(f"_reschedule_daily_job failed: {e}")
+
+
+def _missed_scheduler_wrapper():
+    """Module-level wrapper for missed-scheduler retry logic.
+
+    This moves the inner `_try_schedule_missed` logic to a top-level callable
+    so APScheduler can persist it by textual reference.
+    """
+    try:
+        tz = get_prayer_tz()
+        try:
+            cur = datetime.now(tz).date() if tz is not None else date.today()
+        except Exception:
+            cur = date.today()
+        key = cur.isoformat()
+        MISSED_SCHED_ATTEMPTS[key] = MISSED_SCHED_ATTEMPTS.get(key, 0) + 1
+        attempts = MISSED_SCHED_ATTEMPTS[key]
+        logger.info(f"Missed-scheduler attempt #{attempts} for {key}")
+        cnt = schedule_prayers_for_date(cur)
+        if cnt > 0:
+            logger.info(f"Missed-scheduler: scheduled {cnt} prayer jobs for today; removing retry job")
+            try:
+                scheduler.remove_job('missed-scheduler')
+            except Exception:
+                pass
+            # Ensure the daily rescheduler exists for tomorrow
+            try:
+                if 'rescheduler-daily' not in [j.id for j in scheduler.get_jobs()]:
+                    # schedule textual reference to module-level rescheduler
+                    tomorrow = datetime.combine(cur + timedelta(days=1), datetime.min.time()) + timedelta(minutes=5)
+                    try:
+                        tomorrow = tomorrow.replace(tzinfo=tz)
+                    except Exception:
+                        pass
+                    scheduler.add_job('server._reschedule_daily_job', trigger=DateTrigger(run_date=tomorrow), id='rescheduler-daily')
+            except Exception:
+                pass
+            return
+        if attempts >= 6:
+            logger.info("Missed-scheduler reached 6 attempts; switching to hourly retries")
+            try:
+                scheduler.remove_job('missed-scheduler')
+            except Exception:
+                pass
+            scheduler.add_job('server._missed_scheduler_wrapper', trigger=IntervalTrigger(hours=1), id='missed-scheduler')
+            return
+    except Exception as e:
+        logger.warning(f"Missed-scheduler attempt failed: {e}")
+
 def _http_post_play(filename):
     """POST to the local /api/play endpoint to trigger playback."""
     try:
@@ -290,6 +387,27 @@ def _http_post_play(filename):
             logger.info(f"Scheduled play triggered for {filename}: {resp.status} {resp_body}")
     except Exception as e:
         logger.error(f"Scheduled play POST failed for {filename}: {e}")
+
+
+def control_with_fallback(cloud_fn, local_fn):
+    """Decision engine: try cloud first, fallback to local on failure."""
+    try:
+        # call cloud microservice
+        cloud_url = os.environ.get('SONOS_CLOUD_URL', 'http://127.0.0.1:6000')
+        # cloud_fn is a callable that should perform HTTP request to cloud service
+        try:
+            return cloud_fn(cloud_url)
+        except Exception as e:
+            logger.warning(f"Cloud action failed: {e}; falling back to local SoCo")
+    except Exception as e:
+        logger.warning(f"control_with_fallback cloud check error: {e}")
+    # local fallback
+    try:
+        local_url = os.environ.get('SOCO_LOCAL_URL', 'http://127.0.0.1:5001')
+        return local_fn(local_url)
+    except Exception as e:
+        logger.error(f"Local SoCo action failed: {e}")
+        raise
 
 
 def _http_get_prepare():
@@ -326,10 +444,53 @@ def init_db(db_path=None):
                 ts TEXT NOT NULL
             )
         ''')
+        # Settings table (key/value) for production settings
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        # Test settings (separate table) used by testing environment
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS test_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
         conn.commit()
         conn.close()
     except Exception as e:
         logger.warning(f"init_db failed: {e}")
+
+
+def _read_settings_table(test: bool = False):
+    """Return dict of settings from DB (production or test table)."""
+    table = 'test_settings' if test else 'settings'
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(f"SELECT key, value FROM {table}")
+        rows = c.fetchall()
+        conn.close()
+        return {k: v for k, v in rows}
+    except Exception as e:
+        logger.warning(f"_read_settings_table failed: {e}")
+        return {}
+
+
+def _write_setting(key: str, value: str, test: bool = False):
+    table = 'test_settings' if test else 'settings'
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute(f"INSERT INTO {table} (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        logger.warning(f"_write_setting failed: {e}")
+        return False
 
 
 def append_play_history_sql(filename, when=None):
@@ -380,9 +541,14 @@ def schedule_prayers_for_date(target_date: date):
 
     scheduled_count = 0
     try:
-        # Get coordinates from environment variables if provided, else default to Dubai
-        lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
-        lon = float(os.environ.get('PRAYER_LON', '55.2708'))
+        # Get coordinates from DB settings if provided, else environment, else default to Dubai
+        try:
+            settings = _read_settings_table(test=False)
+            lat = float(settings.get('prayer_lat') or os.environ.get('PRAYER_LAT', '25.2048'))
+            lon = float(settings.get('prayer_lon') or os.environ.get('PRAYER_LON', '55.2708'))
+        except Exception:
+            lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
+            lon = float(os.environ.get('PRAYER_LON', '55.2708'))
         tz = get_prayer_tz()
         # Prefer computing times with the frontend `adhan` implementation via our Node helper
         times = None
@@ -390,7 +556,10 @@ def schedule_prayers_for_date(target_date: date):
             script = os.path.join(os.path.dirname(__file__), 'scripts', 'compute_prayer_times.mjs')
             if os.path.exists(script):
                 cmd = ['node', script, target_date.isoformat()]
-                p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True)
+                # Set TZ environment variable to Asia/Dubai for the subprocess
+                env = os.environ.copy()
+                env['TZ'] = 'Asia/Dubai'
+                p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True, env=env)
                 out, err = p.communicate(timeout=5)
                 if p.returncode == 0 and out:
                     try:
@@ -481,7 +650,9 @@ def schedule_prayers_for_date(target_date: date):
                 continue
             logger.info(f"Scheduling {key} Azan at {scheduled_dt.isoformat()} (job id: {job_id})")
             filename = 'fajr.mp3' if key == 'fajr' else 'azan.mp3'
-            scheduler.add_job(_http_post_play, trigger=DateTrigger(run_date=scheduled_dt), args=[filename], id=job_id)
+            # Use textual reference for the callable so APScheduler can serialize jobs
+            # when using a persistent jobstore (e.g., SQLAlchemyJobStore).
+            scheduler.add_job('server:_http_post_play', trigger=DateTrigger(run_date=scheduled_dt), args=[filename], id=job_id)
             scheduled_count += 1
     except Exception as e:
         logger.error(f"Failed to schedule prayers for {target_date}: {e}")
@@ -491,67 +662,53 @@ def schedule_today_and_rescheduler():
     if not SCHEDULER_AVAILABLE:
         return
     tz = get_prayer_tz()
-    today = date.today()
+    try:
+        today = datetime.now(tz).date() if tz is not None else date.today()
+    except Exception:
+        today = date.today()
 
     # Attempt to schedule today's prayers and record how many jobs were added.
     added = schedule_prayers_for_date(today)
 
-    # Helper to schedule the daily rescheduler (next day at 00:05)
-    def _schedule_daily_rescheduler():
+    # Schedule the daily rescheduler (next day at 00:05) using a module-level
+    # textual reference so APScheduler can persist the job in a SQLAlchemy jobstore.
+    try:
+        tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time()) + timedelta(minutes=5)
         try:
-            tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time()) + timedelta(minutes=5)
             tomorrow = tomorrow.replace(tzinfo=tz)
-            def _resched():
-                schedule_prayers_for_date(date.today())
-            if 'rescheduler-daily' not in [j.id for j in scheduler.get_jobs()]:
-                scheduler.add_job(_resched, trigger=DateTrigger(run_date=tomorrow), id='rescheduler-daily')
-                logger.info(f"Scheduled daily rescheduler at {tomorrow}")
-        except Exception as e:
-            logger.warning(f"Failed to schedule daily rescheduler: {e}")
+        except Exception:
+            pass
+        if 'rescheduler-daily' not in [j.id for j in scheduler.get_jobs()]:
+            scheduler.add_job('server:_reschedule_daily_job', trigger=DateTrigger(run_date=tomorrow), id='rescheduler-daily')
+            logger.info(f"Scheduled daily rescheduler at {tomorrow}")
+    except Exception as e:
+        logger.warning(f"Failed to schedule daily rescheduler: {e}")
 
     # If nothing was scheduled for today (device may have been down at midnight),
     # add a retry job that will attempt to schedule today's prayers until successful.
     # Start with 5-minute retries for the first 6 attempts, then switch to hourly.
     if added == 0:
         try:
-            def _try_schedule_missed():
-                try:
-                    key = date.today().isoformat()
-                    MISSED_SCHED_ATTEMPTS[key] = MISSED_SCHED_ATTEMPTS.get(key, 0) + 1
-                    attempts = MISSED_SCHED_ATTEMPTS[key]
-                    logger.info(f"Missed-scheduler attempt #{attempts} for {key}")
-                    cnt = schedule_prayers_for_date(date.today())
-                    if cnt > 0:
-                        logger.info(f"Missed-scheduler: scheduled {cnt} prayer jobs for today; removing retry job")
-                        try:
-                            scheduler.remove_job('missed-scheduler')
-                        except Exception:
-                            pass
-                        # After successfully scheduling today's jobs, ensure the daily rescheduler exists
-                        _schedule_daily_rescheduler()
-                        return
-                    # If we've tried 6 times at 5-minute intervals, switch to hourly retries
-                    if attempts >= 6:
-                        logger.info("Missed-scheduler reached 6 attempts; switching to hourly retries")
-                        try:
-                            scheduler.remove_job('missed-scheduler')
-                        except Exception:
-                            pass
-                        # Add a new job that runs hourly
-                        scheduler.add_job(_try_schedule_missed, trigger=IntervalTrigger(hours=1), id='missed-scheduler')
-                        return
-                    # Otherwise, continue retrying every 5 minutes (job remains)
-                except Exception as e:
-                    logger.warning(f"Missed-scheduler attempt failed: {e}")
-
+            # Use module-level wrapper `_missed_scheduler_wrapper` so jobstore can persist it
             if 'missed-scheduler' not in [j.id for j in scheduler.get_jobs()]:
-                scheduler.add_job(_try_schedule_missed, trigger=IntervalTrigger(minutes=5), id='missed-scheduler')
+                scheduler.add_job('server:_missed_scheduler_wrapper', trigger=IntervalTrigger(minutes=5), id='missed-scheduler')
                 logger.info("Scheduled missed-scheduler job: 5-minute retries (first 6 attempts), then hourly")
         except Exception as e:
             logger.warning(f"Failed to schedule missed-scheduler: {e}")
     else:
         # If we scheduled jobs now, ensure the daily rescheduler is also scheduled
-        _schedule_daily_rescheduler()
+        try:
+            # schedule textual module-level rescheduler (already added above in normal flow)
+            tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time()) + timedelta(minutes=5)
+            try:
+                tomorrow = tomorrow.replace(tzinfo=tz)
+            except Exception:
+                pass
+            if 'rescheduler-daily' not in [j.id for j in scheduler.get_jobs()]:
+                scheduler.add_job('server:_reschedule_daily_job', trigger=DateTrigger(run_date=tomorrow), id='rescheduler-daily')
+                logger.info(f"Scheduled daily rescheduler at {tomorrow}")
+        except Exception:
+            pass
 
 
 @app.route('/api/scheduler/jobs', methods=['GET'])
@@ -588,7 +745,12 @@ def api_force_schedule_today():
     if not SCHEDULER_AVAILABLE:
         return jsonify({'available': False, 'jobs_added': 0, 'message': 'Scheduler not available'})
     try:
-        added = schedule_prayers_for_date(date.today())
+        tz = get_prayer_tz()
+        try:
+            tgt = datetime.now(tz).date() if tz is not None else date.today()
+        except Exception:
+            tgt = date.today()
+        added = schedule_prayers_for_date(tgt)
         # Ensure daily rescheduler exists
         try:
             schedule_today_and_rescheduler()
@@ -638,6 +800,125 @@ def api_simulate_play():
         return jsonify({'status': 'ok', 'appended': {'file': fname, 'ts': when.isoformat()}, 'history_tail': recent})
     except Exception as e:
         logger.error(f"simulate-play error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/test/play', methods=['POST'])
+def api_test_play():
+    """Test-only play endpoint. Simulates a play and appends play-history for testing.
+
+    Accepts JSON: {"file":"azan.mp3","volume":50,"ts":"optional ISO"}
+    This endpoint is safe for testing and does not perform real Sonos control.
+    """
+    try:
+        data = request.get_json(silent=True) or {}
+        fname = (data.get('file') or 'azan.mp3').strip()
+        ts_str = data.get('ts')
+        # Append to play history so scheduler logic can see it
+        try:
+            if ts_str:
+                when = datetime.fromisoformat(ts_str)
+                _append_play_history(fname, when=when)
+            else:
+                _append_play_history(fname)
+        except Exception:
+            try:
+                _append_play_history(fname)
+            except Exception:
+                pass
+        return jsonify({'status': 'ok', 'simulated': True, 'file': fname})
+    except Exception as e:
+        logger.error(f"test-play error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/settings', methods=['GET', 'POST'])
+def api_settings():
+    """Get or update production settings stored in DB.
+
+    GET: returns JSON object of settings (keys: prayer_lat, prayer_lon, calc_method, asr_madhab, css_mode, adhan_mode, sonos_mode)
+    POST: accepts JSON with any of those keys to update them.
+    """
+    try:
+        if request.method == 'GET':
+            data = _read_settings_table(test=False)
+            # Provide defaults when missing
+            defaults = {
+                'prayer_lat': '25.2048',
+                'prayer_lon': '55.2708',
+                'calc_method': 'IACAD',
+                'asr_madhab': 'Shafi',
+                'css_mode': 'online',
+                'adhan_mode': 'online',
+                'sonos_mode': 'online'
+            }
+            for k, v in defaults.items():
+                data.setdefault(k, v)
+            # Do not expose the passcode via the public GET settings API
+            # (passcode is used only for POST enforcement).
+            if 'passcode' in data:
+                try:
+                    data.pop('passcode')
+                except Exception:
+                    pass
+            return jsonify(data)
+        else:
+                payload = request.get_json(silent=True) or {}
+                # Optional enforcement: require a passcode header for production settings
+                enforce = os.environ.get('BILAL_ENFORCE_SETTINGS_API', '')
+                if str(enforce).lower() in ('1', 'true', 'yes'):
+                    # Expect header 'X-BILAL-PASSCODE'
+                    received = request.headers.get('X-BILAL-PASSCODE', '')
+                    try:
+                        settings = _read_settings_table(test=False)
+                        stored_pass = settings.get('passcode', '1234')
+                    except Exception:
+                        stored_pass = '1234'
+                    if not received or str(received) != str(stored_pass):
+                        logger.warning('Forbidden settings POST: missing/invalid X-BILAL-PASSCODE')
+                        return jsonify({'status': 'error', 'message': 'forbidden: invalid passcode header'}), 403
+
+                for k, v in payload.items():
+                    try:
+                        _write_setting(k, str(v), test=False)
+                    except Exception:
+                        logger.warning(f"Failed to write setting {k}")
+                return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"api_settings error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/test/settings', methods=['GET', 'POST'])
+def api_test_settings():
+    """Get or update test settings stored in DB (separate table).
+    Same schema as production settings but applied to test environment.
+    """
+    try:
+        if request.method == 'GET':
+            data = _read_settings_table(test=True)
+            defaults = {
+                'prayer_lat': '25.2048',
+                'prayer_lon': '55.2708',
+                'calc_method': 'IACAD',
+                'asr_madhab': 'Shafi',
+                'css_mode': 'online',
+                'adhan_mode': 'online',
+                'sonos_mode': 'online'
+            }
+            for k, v in defaults.items():
+                data.setdefault(k, v)
+            return jsonify(data)
+        else:
+            payload = request.get_json(silent=True) or {}
+            for k, v in payload.items():
+                try:
+                    _write_setting(k, str(v), test=True)
+                except Exception:
+                    logger.warning(f"Failed to write test setting {k}")
+            return jsonify({'status': 'ok'})
+    except Exception as e:
+        logger.error(f"api_test_settings error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
@@ -777,6 +1058,64 @@ def play_audio():
         tz = None
 
     try:
+        # Prefer cloud control, fallback to local SoCo
+        def cloud_action(cloud_url):
+            # cloud microservice expects device_id and url; here we use coordinator discovery to find first cloud-device
+            # For simplicity, we call cloud discover and pick the first player id (if any) and then play
+            r = requests.get(f"{cloud_url}/cloud/discover", timeout=5)
+            if r.status_code != 200:
+                raise Exception('cloud discover failed')
+            data = r.json()
+            # data expected to be list of players
+            if not data:
+                raise Exception('no cloud devices')
+            device = data[0]
+            # Normalize device id selection from a variety of possible keys returned
+            device_id = None
+            if isinstance(device, dict):
+                for k in ('id', 'playerId', 'player_id', 'uid', 'playerID'):
+                    v = device.get(k)
+                    if v:
+                        device_id = v
+                        break
+            # If device is an object with attributes (unlikely), try attribute access
+            if not device_id:
+                try:
+                    device_id = getattr(device, 'id', None) or getattr(device, 'playerId', None) or getattr(device, 'uid', None)
+                except Exception:
+                    device_id = None
+            if not device_id:
+                raise Exception('no device id')
+            local_ip = get_local_ip()
+            audio_url = f"http://{local_ip}:5000/audio/{filename}"
+            pr = requests.post(f"{cloud_url}/cloud/play", json={'device_id': device_id, 'url': audio_url}, timeout=5)
+            if pr.status_code != 200:
+                raise Exception('cloud play failed')
+            return {'status': 'ok', 'mode': 'cloud'}
+
+        def local_action(local_url):
+            # Call local SoCo server to discover coordinator and play
+            r = requests.get(f"{local_url}/local/discover", timeout=5)
+            if r.status_code != 200:
+                raise Exception('local discover failed')
+            devices = r.json()
+            if not devices:
+                raise Exception('no local devices')
+            # pick first device name
+            name = devices[0].get('name')
+            local_ip = get_local_ip()
+            audio_url = f"http://{local_ip}:5000/audio/{filename}"
+            pr = requests.post(f"{local_url}/local/play", json={'device_name': name, 'url': audio_url}, timeout=5)
+            if pr.status_code not in (200, 204):
+                raise Exception('local play failed')
+            return {'status': 'ok', 'mode': 'local'}
+
+        result = control_with_fallback(cloud_action, local_action)
+        # If cloud/local handled playback, return success
+        if result and result.get('status') == 'ok':
+            return jsonify({'status': 'success', 'message': 'Playback Started', 'mode': result.get('mode')})
+        # otherwise continue into original local logic as a last resort
+
         speakers = get_sonos_speakers()
         if not speakers:
             logger.error("No speakers found for Azan playback")
@@ -1053,19 +1392,27 @@ def monitor_playback(coordinator, speakers, audio_url, session_id=None):
 
 if __name__ == '__main__':
     logger.info("Server Starting on Port 5000...")
-    # Initialize and start scheduler if available
-    if SCHEDULER_AVAILABLE:
+    # Optionally start an in-process scheduler. When running a dedicated
+    # scheduler service we prefer that service to own the scheduler; set
+    # BILAL_RUN_SCHEDULER=0 in the backend unit to disable the in-process
+    # scheduler.
+    run_scheduler_flag = os.environ.get('BILAL_RUN_SCHEDULER', '1')
+    run_scheduler = str(run_scheduler_flag).lower() not in ('0', 'false', 'no')
+
+    if SCHEDULER_AVAILABLE and run_scheduler:
         try:
             # Ensure DB exists for jobstore and play history
             try:
                 init_db(DB_PATH)
             except Exception:
                 pass
-            if SQLALCHEMY_AVAILABLE:
+            if globals().get('SQLALCHEMY_AVAILABLE'):
                 jobstores = {'default': SQLAlchemyJobStore(url=f'sqlite:///{DB_PATH}')}
                 scheduler = BackgroundScheduler(jobstores=jobstores)
+                logger.info('APScheduler + SQLAlchemy detected: persistent jobstore enabled')
             else:
                 scheduler = BackgroundScheduler()
+                logger.info('APScheduler detected but SQLAlchemy not available: using in-memory scheduler (no persistence)')
             scheduler.start()
             logger.info("BackgroundScheduler started")
             # Schedule today's prayers and a daily rescheduler job
@@ -1074,7 +1421,13 @@ if __name__ == '__main__':
         except Exception as e:
             logger.error(f"Failed to start scheduler: {e}")
     else:
-        logger.info("Scheduler not available in this environment; automatic scheduling disabled")
+        if not SCHEDULER_AVAILABLE:
+            logger.info("Scheduler not available in this environment; automatic scheduling disabled")
+            # If we captured import-time errors, log the traceback to help operators
+            if globals().get('SCHEDULER_IMPORT_ERROR'):
+                logger.warning(f"Scheduler import error (missing dependencies?):\n{globals().get('SCHEDULER_IMPORT_ERROR')}")
+        else:
+            logger.info("BILAL_RUN_SCHEDULER=0; skipping in-process scheduler startup")
 
     app.run(host='0.0.0.0', port=5000)
 
