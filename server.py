@@ -840,6 +840,20 @@ def list_scheduled_jobs():
     return jsonify({'available': True, 'jobs': jobs})
 
 
+@app.route('/api/play/history', methods=['GET'])
+def api_play_history():
+    """Return recent play history entries from the backend (file, ts).
+
+    This endpoint is used by the frontend to infer whether scheduled prayers
+    were played (success) or missed (failed).
+    """
+    try:
+        recent = read_recent_play_history(100)
+    except Exception:
+        recent = []
+    return jsonify({'status': 'ok', 'history': recent})
+
+
 @app.route('/api/scheduler/force-schedule', methods=['POST'])
 def api_force_schedule_today():
     """Force a run of today's scheduling (useful for testing). Returns number of jobs scheduled."""

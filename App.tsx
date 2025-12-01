@@ -25,6 +25,7 @@ import {
   Sun,
   Moon,
   Zap,
+  RefreshCw,
   CloudRain
 } from 'lucide-react';
 import { format } from 'date-fns';
@@ -32,6 +33,8 @@ import { format } from 'date-fns';
 const App: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date());
   const [schedule, setSchedule] = useState<PrayerSchedule[]>([]);
+  const [refreshingSchedule, setRefreshingSchedule] = useState(false);
+  const [playToleranceMin, setPlayToleranceMin] = useState<number>(5);
   const [nextPrayer, setNextPrayer] = useState<PrayerSchedule | null>(null);
   const [zones, setZones] = useState<SonosZone[]>(INITIAL_ZONES);
   const [appState, setAppState] = useState<AppState>(AppState.IDLE);
@@ -50,60 +53,117 @@ const App: React.FC = () => {
     }]);
   }, []);
 
-  // Polling: refresh zones and scheduler jobs every 30s so UI comes from DB
+  // Polling: refresh zones and scheduler jobs every 5 minutes so UI comes from DB.
+  // Expose `fetchSchedulerJobs` so manual refresh button can trigger it.
+  const fetchZones = useCallback(async () => {
+    try {
+      const res = await fetch('/api/zones');
+      if (!res.ok) throw new Error('zones fetch failed');
+      const data = await res.json();
+      if (Array.isArray(data) && data.length > 0) {
+        setZones(data);
+      } else {
+        setZones([{ id: ZoneId.Zone1, name: 'Onboard Audio', isAvailable: true, status: 'idle', volume: 30 }]);
+      }
+    } catch (e:any) {
+      addLog('WARN', `Failed to refresh zones: ${e.message || e}`);
+    }
+  }, [addLog]);
+
+  const fetchPlayHistory = useCallback(async () => {
+    try {
+      const res = await fetch('/api/play/history');
+      if (!res.ok) return [];
+      const d = await res.json();
+      return Array.isArray(d.history) ? d.history : [];
+    } catch (e:any) {
+      return [];
+    }
+  }, []);
+
+  const fetchSchedulerJobs = useCallback(async () => {
+    setRefreshingSchedule(true);
+    try {
+      const res = await fetch('/api/scheduler/jobs');
+      if (!res.ok) throw new Error('scheduler jobs fetch failed');
+      const data = await res.json();
+      if (data && Array.isArray(data.jobs)) {
+        const todayStr = new Date().toISOString().slice(0,10);
+        const mapped = data.jobs
+          .map((j:any) => {
+            const parts = (j.id || '').split('-');
+            const prayerKey = (parts[3] || '').toLowerCase();
+            const PRAYER_KEY_MAP: Record<string,string> = {
+              'fajr': 'Fajr',
+              'dhuhr': 'Dhuhr',
+              'asr': 'Asr',
+              'maghrib': 'Maghrib',
+              'isha': 'Isha'
+            };
+            if (!PRAYER_KEY_MAP[prayerKey]) return null;
+            const name = PRAYER_KEY_MAP[prayerKey] as any;
+            const time = j.next_run_time ? new Date(j.next_run_time) : null;
+            return time ? { name, time, isNext: false } : null;
+          })
+          .filter(Boolean) as any[];
+
+        let todayJobs = mapped.filter(ms => ms.time.toISOString().slice(0,10) === todayStr);
+        todayJobs.sort((a:any,b:any) => a.time.getTime() - b.time.getTime());
+
+        // fetch play history and infer status for past jobs
+        const history = await fetchPlayHistory();
+        const now = new Date();
+        const tolMin = Number(playToleranceMin) || 5; // tolerance window in minutes (configurable)
+        const annotated = todayJobs.map((job:any) => {
+          const isPast = job.time < now;
+          let status: 'success'|'failed'|'pending' = 'pending';
+          if (isPast) {
+            // look for a play history entry within +/- tolMin minutes matching expected file
+            const expectedFile = job.name === 'Fajr' ? 'fajr.mp3' : 'azan.mp3';
+            let played = false;
+            for (const entry of history) {
+              try {
+                const p_ts = new Date(entry.ts);
+                const delta = Math.abs((p_ts.getTime() - job.time.getTime()) / 1000);
+                if (delta <= tolMin * 60 && entry.file && entry.file.indexOf(expectedFile) !== -1) {
+                  played = true;
+                  break;
+                }
+              } catch (e) { continue; }
+            }
+            status = played ? 'success' : 'failed';
+          }
+          return { ...job, status };
+        });
+
+        setSchedule(annotated);
+        setNextPrayer(getNextPrayer(annotated as any));
+      }
+    } catch (e:any) {
+      addLog('WARN', `Failed to refresh scheduler jobs: ${e.message || e}`);
+    } finally {
+      setRefreshingSchedule(false);
+    }
+  }, [addLog, fetchPlayHistory]);
+
+  // Load settings (including play tolerance) so status inference uses configured value
+  const fetchSettings = useCallback(async () => {
+    try {
+      const res = await fetch('/api/settings');
+      if (!res.ok) return;
+      const d = await res.json();
+      const val = Number(d.prayer_play_tolerance_min || d.prayer_play_tol_min || d.PRAYER_PLAY_TOL_MIN || d.play_tolerance_min || 5);
+      if (!isNaN(val)) setPlayToleranceMin(val);
+    } catch (e) { }
+  }, []);
+
+  useEffect(() => {
+    // initial settings load
+    fetchSettings();
+  }, [fetchSettings]);
+
   useEffect(() => {
     let stopped = false;
-
-    const fetchZones = async () => {
-      try {
-        const res = await fetch('/api/zones');
-        if (!res.ok) throw new Error('zones fetch failed');
-        const data = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          setZones(data);
-        } else {
-          setZones([{ id: ZoneId.Zone1, name: 'Onboard Audio', isAvailable: true, status: 'idle', volume: 30 }]);
-        }
-      } catch (e:any) {
-        addLog('WARN', `Failed to refresh zones: ${e.message || e}`);
-      }
-    };
-
-    const fetchSchedulerJobs = async () => {
-      try {
-        const res = await fetch('/api/scheduler/jobs');
-        if (!res.ok) throw new Error('scheduler jobs fetch failed');
-        const data = await res.json();
-        if (data && Array.isArray(data.jobs)) {
-          const todayStr = new Date().toISOString().slice(0,10);
-          const mapped = data.jobs
-            .map((j:any) => {
-              const parts = (j.id || '').split('-');
-              const prayerKey = (parts[3] || '').toLowerCase();
-              const PRAYER_KEY_MAP: Record<string,string> = {
-                'fajr': 'Fajr',
-                'dhuhr': 'Dhuhr',
-                'asr': 'Asr',
-                'maghrib': 'Maghrib',
-                'isha': 'Isha'
-              };
-              if (!PRAYER_KEY_MAP[prayerKey]) return null;
-              const name = PRAYER_KEY_MAP[prayerKey] as any;
-              const time = j.next_run_time ? new Date(j.next_run_time) : null;
-              return time ? { name, time, isNext: false } : null;
-            })
-            .filter(Boolean) as any[];
-
-          const todayJobs = mapped.filter(ms => ms.time.toISOString().slice(0,10) === todayStr);
-          todayJobs.sort((a:any,b:any) => a.time.getTime() - b.time.getTime());
-          setSchedule(todayJobs);
-          setNextPrayer(getNextPrayer(todayJobs));
-        }
-      } catch (e:any) {
-        addLog('WARN', `Failed to refresh scheduler jobs: ${e.message || e}`);
-      }
-    };
-
     fetchZones();
     fetchSchedulerJobs();
 
@@ -111,10 +171,10 @@ const App: React.FC = () => {
       if (stopped) return;
       fetchZones();
       fetchSchedulerJobs();
-    }, 30_000);
+    }, 300_000); // 5 minutes
 
     return () => { stopped = true; clearInterval(id); };
-  }, [addLog]);
+  }, [fetchZones, fetchSchedulerJobs]);
 
   // Initial Load & Sync with Backend
   useEffect(() => {
@@ -224,6 +284,8 @@ const App: React.FC = () => {
       setSchedule(dailySchedule);
       setNextPrayer(getNextPrayer(dailySchedule));
       addLog('INFO', 'Prayer schedule refreshed');
+      // Re-load settings so play-tolerance updates take effect immediately
+      try { await fetchSettings(); } catch (e) {}
     } catch (e:any) {
       addLog('ERROR', `Failed to refresh schedule: ${e.message || e}`);
     }
@@ -282,16 +344,28 @@ const App: React.FC = () => {
         <main className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
           <div className="lg:col-span-4 space-y-6">
             <div className="bg-slate-900 rounded-2xl p-6 border border-slate-800 shadow-lg">
-              <h2 className="text-slate-200 font-semibold mb-4 flex items-center gap-2"><CloudRain size={18} className="text-blue-400" /> Today's Schedule</h2>
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-slate-200 font-semibold flex items-center gap-2"><CloudRain size={18} className="text-blue-400" /> Today's Schedule</h2>
+                <div className="flex items-center gap-2">
+                  <button onClick={fetchSchedulerJobs} title={refreshingSchedule ? 'Refreshing' : 'Refresh schedule'} className={`p-2 ${refreshingSchedule ? 'bg-slate-700' : 'bg-slate-800 hover:bg-slate-700'} rounded-full border border-slate-700 transition-all text-slate-400 flex items-center justify-center`}>
+                    <RefreshCw size={16} className={`${refreshingSchedule ? 'animate-spin text-emerald-300' : 'text-slate-300'}`} />
+                    <span className="sr-only">Refresh schedule</span>
+                  </button>
+                </div>
+              </div>
               <div className="space-y-1">
                 {schedule.map((prayer) => {
                   const isPast = prayer.time < currentTime;
                   const isNext = nextPrayer?.name === prayer.name;
+                  const status = (prayer as any).status || 'pending';
+                  const dotClass = status === 'success' ? 'bg-blue-400' : status === 'failed' ? 'bg-red-400' : (isNext ? 'bg-emerald-400 animate-pulse' : isPast ? 'bg-slate-600' : 'bg-slate-400');
+                  const nameClass = status === 'success' ? 'text-blue-200' : status === 'failed' ? 'text-red-300' : (isNext ? 'text-emerald-300' : 'text-slate-300');
+                  const rowBg = isNext ? 'bg-emerald-900/30 border border-emerald-500/30' : 'hover:bg-slate-800/50';
                   return (
-                    <div key={prayer.name + String(prayer.time)} className={`flex justify-between items-center p-3 rounded-lg transition-colors ${isNext ? 'bg-emerald-900/30 border border-emerald-500/30' : 'hover:bg-slate-800/50'} ${isPast ? 'opacity-50' : 'opacity-100'}`}>
+                    <div key={prayer.name + String(prayer.time)} className={`flex justify-between items-center p-3 rounded-lg transition-colors ${rowBg} ${isPast ? '' : ''}`}>
                       <div className="flex items-center gap-3">
-                        <div className={`w-2 h-2 rounded-full ${isNext ? 'bg-emerald-400 animate-pulse' : isPast ? 'bg-slate-600' : 'bg-slate-400'}`} />
-                        <span className={`text-sm font-medium ${isNext ? 'text-emerald-300' : 'text-slate-300'}`}>{prayer.name}</span>
+                        <div className={`w-2 h-2 rounded-full ${dotClass}`} />
+                        <span className={`text-sm font-medium ${nameClass}`}>{prayer.name}</span>
                       </div>
                       <span className="font-mono text-sm text-slate-400">{format(prayer.time, 'HH:mm')}</span>
                     </div>

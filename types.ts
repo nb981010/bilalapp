@@ -30,6 +30,9 @@ export interface PrayerSchedule {
   name: PrayerName;
   time: Date;
   isNext: boolean;
+  // Optional runtime status inferred from play history: 'success' when played on time,
+  // 'failed' when time passed without evidence of playback, otherwise 'pending'.
+  status?: 'success' | 'failed' | 'pending';
 }
 
 export interface LogEntry {
