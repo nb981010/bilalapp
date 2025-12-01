@@ -49,8 +49,8 @@ done
 echo "Bilal installer running from: $APP_DIR"
 
 echo "Updating apt and installing system packages..."
-sudo apt-get update -y
-sudo apt-get install -y python3-venv python3-distutils nodejs npm sqlite3 curl iproute2 psmisc
+sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv python3-distutils nodejs npm sqlite3 curl iproute2 psmisc
 
 echo "Preparing Python virtualenv at $VENV_DIR..."
 if [ ! -d "$VENV_DIR" ]; then
@@ -109,9 +109,16 @@ if [ ! -f "$DB_PATH" ]; then
 fi
 chmod 664 "$DB_PATH" || true
 
-echo "Ensuring default production passcode is set (default: 2234)..."
+echo "Ensuring settings table exists and default production passcode is set (default: 2234)..."
+# Ensure the settings table exists before attempting to insert the passcode
+sqlite3 "$DB_PATH" "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);" || true
 # Insert passcode only if missing; do not overwrite an existing passcode.
-sqlite3 "$DB_PATH" "INSERT INTO settings (key, value) SELECT 'passcode','2234' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='passcode');" || true
+sqlite3 "$DB_PATH" "INSERT OR IGNORE INTO settings (key, value) VALUES ('passcode','2234');" || true
+
+# Ensure DB file ownership is appropriate for the runtime user (if using system service)
+if [ -n "$RUN_USER" ]; then
+  sudo chown "$RUN_USER":"$RUN_USER" "$DB_PATH" || true
+fi
 
 if [ $INSTALL_SERVICE -eq 1 ]; then
   echo "Creating systemd unit at $SERVICE_PATH (requires sudo)"

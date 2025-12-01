@@ -11,6 +11,7 @@ import { INITIAL_ZONES } from './constants.ts';
 import { getPrayerTimes, getNextPrayer } from './services/prayerService.ts';
 import LogsViewer from './components/LogsViewer.tsx';
 import ZoneGrid from './components/ZoneGrid.tsx';
+import SettingsModal from './components/SettingsModal.tsx';
 import SettingsTab from './components/SettingsTab.tsx';
 import TestTab from './components/TestTab.tsx';
 import { 

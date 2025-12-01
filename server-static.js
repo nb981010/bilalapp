@@ -27,6 +27,7 @@ function sendFile(res, filePath) {
       res.end('404 Not Found');
       return;
     }
+    // Serve with long-lived caching by default (matches previous behavior)
     res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'public, max-age=31536000' });
     res.end(content);
   });
