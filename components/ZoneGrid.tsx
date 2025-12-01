@@ -36,7 +36,10 @@ const ZoneGrid: React.FC<ZoneGridProps> = ({ zones }) => {
             )}
           </div>
 
-          <h4 className="font-medium text-slate-200 text-sm truncate">{zone.name}</h4>
+          <h4 className="font-medium text-slate-200 text-sm truncate">
+            {zone.name}
+            <span className="ml-2 text-xs text-slate-400">[{zone.system || 'unknown'}]</span>
+          </h4>
           
           <div className="mt-2 flex items-center justify-between text-xs">
             <span className={`px-2 py-0.5 rounded-full border ${

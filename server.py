@@ -203,40 +203,67 @@ def list_zones():
     """Return list of available zones and their status."""
     logger.info("API /api/zones requested")
     try:
-        speakers = get_sonos_speakers()
-        found_names = [s.player_name for s in speakers]
-        data = []
-        # Add discovered zones that match static names
-        for s in speakers:
-            if s.player_name in STATIC_ZONE_NAMES:
-                status = 'idle'
-                try:
-                    info = s.get_current_transport_info()
-                    if info['current_transport_state'] == 'PLAYING':
-                        status = 'playing_music'
-                except Exception as e:
-                    logger.warning(f"Failed to get transport info for {s.player_name}: {e}")
-                data.append({
-                    "id": s.uid,
-                    "name": s.player_name,
-                    "isAvailable": True,
-                    "status": status,
-                    "volume": s.volume
-                })
-        # Add static zones not found in discovery as offline
-        for name in STATIC_ZONE_NAMES:
-            if name not in found_names:
-                data.append({
-                    "id": name,
-                    "name": name,
+        enabled = _get_enabled_audio_systems()
+        zones = []
+
+        # If Sonos enabled, attempt discovery (fast)
+        if 'sonos' in enabled:
+            try:
+                sonos_list = get_sonos_speakers() or []
+                for s in sonos_list:
+                    try:
+                        zid = getattr(s, 'uid', None) or getattr(s, 'player_name', str(s))
+                        zones.append({
+                            "id": str(zid),
+                            "name": str(getattr(s, 'player_name', zid)),
+                            "isAvailable": True,
+                            "status": "online",
+                            "volume": getattr(s, 'volume', 0),
+                            "system": "sonos"
+                        })
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.warning(f"Sonos discovery failed: {e}")
+
+        # Onboard: if enabled, add a virtual onboard 'Onboard' zone
+        if 'onboard' in enabled:
+            zones.append({
+                "id": "onboard",
+                "name": "Onboard",
+                "isAvailable": True,
+                "status": "online",
+                "volume": 0,
+                "system": "onboard"
+            })
+
+        # TOA: placeholder entry when enabled
+        if 'toa' in enabled:
+            zones.append({
+                "id": "toa",
+                "name": "TOA",
+                "isAvailable": False,
+                "status": "offline",
+                "volume": 0,
+                "system": "toa"
+            })
+
+        # If no dynamic zones found, fall back to STATIC_ZONE_NAMES (mark offline)
+        if not zones:
+            for n in STATIC_ZONE_NAMES:
+                zones.append({
+                    "id": n,
+                    "name": n,
                     "isAvailable": False,
                     "status": "offline",
-                    "volume": 0
+                    "volume": 0,
+                    "system": "static"
                 })
-        logger.info(f"API /api/zones returning {len(data)} zones")
-        return jsonify(data)
+
+        logger.info(f"API /api/zones returning {len(zones)} zones")
+        return jsonify(zones)
     except Exception as e:
-        logger.error(f"API /api/zones error: {e}")
+        logger.exception("list_zones failed")
         return jsonify([]), 500
 
 
@@ -501,6 +528,36 @@ def _write_setting(key: str, value: str, test: bool = False):
     except Exception as e:
         logger.warning(f"_write_setting failed: {e}")
         return False
+
+
+# --- Audio system settings helper ---
+def _get_enabled_audio_systems(test: bool = False):
+    """
+    Return a list of enabled audio systems from the DB settings table.
+    Stored as a JSON array string under key 'enabled_audio_systems'.
+    Returns default ['onboard'] when missing or invalid.
+    """
+    try:
+        settings = _read_settings_table(test=test) or {}
+        raw = settings.get('enabled_audio_systems')
+        if raw:
+            # stored as JSON string in DB
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = None
+            else:
+                parsed = raw
+            if isinstance(parsed, (list, tuple)):
+                return [str(x).lower() for x in parsed]
+    except Exception:
+        logger.debug("Failed to read enabled_audio_systems from DB, falling back to default")
+    return ['onboard']
+
+
+def _ensure_sonos_enabled():
+    return 'sonos' in _get_enabled_audio_systems()
 
 
 def append_play_history_sql(filename, when=None):
@@ -993,8 +1050,9 @@ def api_settings():
     POST: accepts JSON with any of those keys to update them.
     """
     try:
+        test = False
         if request.method == 'GET':
-            data = _read_settings_table(test=False)
+            data = _read_settings_table(test=test) or {}
             # Provide defaults when missing
             defaults = {
                 'prayer_lat': '25.2048',
@@ -1008,37 +1066,58 @@ def api_settings():
             for k, v in defaults.items():
                 data.setdefault(k, v)
             # Do not expose the passcode via the public GET settings API
-            # (passcode is used only for POST enforcement).
             if 'passcode' in data:
                 try:
                     data.pop('passcode')
                 except Exception:
                     pass
+            # Include parsed enabled_audio_systems
+            try:
+                data['enabled_audio_systems'] = _get_enabled_audio_systems(test=test)
+            except Exception:
+                data['enabled_audio_systems'] = ['onboard']
             return jsonify(data)
         else:
-                payload = request.get_json(silent=True) or {}
-                # Optional enforcement: require a passcode header for production settings
-                enforce = os.environ.get('BILAL_ENFORCE_SETTINGS_API', '')
-                if str(enforce).lower() in ('1', 'true', 'yes'):
-                    # Expect header 'X-BILAL-PASSCODE'
-                    received = request.headers.get('X-BILAL-PASSCODE', '')
-                    try:
-                        settings = _read_settings_table(test=False)
-                        stored_pass = settings.get('passcode', '1234')
-                    except Exception:
-                        stored_pass = '1234'
-                    if not received or str(received) != str(stored_pass):
-                        logger.warning('Forbidden settings POST: missing/invalid X-BILAL-PASSCODE')
-                        return jsonify({'status': 'error', 'message': 'forbidden: invalid passcode header'}), 403
+            payload = request.get_json(silent=True) or {}
+            # Optional enforcement: require a passcode header for production settings
+            enforce = os.environ.get('BILAL_ENFORCE_SETTINGS_API', '')
+            if str(enforce).lower() in ('1', 'true', 'yes'):
+                # Expect header 'X-BILAL-PASSCODE'
+                received = request.headers.get('X-BILAL-PASSCODE', '')
+                try:
+                    settings = _read_settings_table(test=False)
+                    stored_pass = settings.get('passcode', '1234')
+                except Exception:
+                    stored_pass = '1234'
+                if not received or str(received) != str(stored_pass):
+                    logger.warning('Forbidden settings POST: missing/invalid X-BILAL-PASSCODE')
+                    return jsonify({'status': 'error', 'message': 'forbidden: invalid passcode header'}), 403
 
-                for k, v in payload.items():
-                    try:
-                        _write_setting(k, str(v), test=False)
-                    except Exception:
-                        logger.warning(f"Failed to write setting {k}")
-                return jsonify({'status': 'ok'})
+            # If enabled_audio_systems provided, validate and persist as JSON string
+            if 'enabled_audio_systems' in payload:
+                val = payload.get('enabled_audio_systems')
+                if not isinstance(val, list):
+                    return jsonify({'status': 'error', 'message': 'enabled_audio_systems must be a list'}), 400
+                allowed = {'sonos', 'toa', 'onboard'}
+                cleaned = []
+                for item in val:
+                    s = str(item).strip().lower()
+                    if s not in allowed:
+                        return jsonify({'status': 'error', 'message': f'invalid audio system: {item}'}), 400
+                    cleaned.append(s)
+                _write_setting('enabled_audio_systems', json.dumps(cleaned), test=False)
+
+            # Persist any other provided keys using existing mechanism
+            for k, v in payload.items():
+                if k == 'enabled_audio_systems':
+                    continue
+                try:
+                    _write_setting(k, str(v), test=False)
+                except Exception:
+                    logger.warning(f"Failed to write setting {k}")
+            return jsonify({'status': 'ok'})
     except Exception as e:
-        logger.error(f"api_settings error: {e}")
+        logger.exception("api_settings error")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
@@ -1274,19 +1353,19 @@ def prepare_group():
     """
     global SONOS_GROUPS
     logger.info("Preparing Zones for Azan...")
-    
+    # Ensure Sonos is enabled in settings before attempting discovery/control
+    if not _ensure_sonos_enabled():
+        logger.info("Sonos system is disabled via settings; skipping prepare")
+        return jsonify({"status": "error", "message": "Sonos disabled in settings"}), 409
+
     try:
         speakers = get_sonos_speakers()
         if not speakers:
             return jsonify({"status": "error", "message": "No speakers found"}), 404
 
-        # 1. Snapshot current state (volume, URI, position) logic omitted for brevity in V1, 
-        #    but we just group them now.
-        
         coordinator = speakers[0]
         logger.info(f"Elected Coordinator: {coordinator.player_name}")
 
-        # 2. Join all others to coordinator
         for s in speakers[1:]:
             logger.info(f"Joining {s.player_name} to {coordinator.player_name}")
             try:
@@ -1309,6 +1388,10 @@ def play_audio():
     if AZAN_LOCK:
         logger.warning("Azan already in progress, blocking duplicate playback.")
         return jsonify({"status": "error", "message": "Azan in progress, playback blocked."}), 429
+    # Prevent Sonos network activity when Sonos is disabled in settings
+    if not _ensure_sonos_enabled():
+        logger.info("Sonos system disabled in settings; rejecting play request to avoid network discovery")
+        return jsonify({"status": "error", "message": "Sonos disabled in settings"}), 409
     data = request.json
     # Incoming requests may specify prayer-specific filenames (e.g. dhuhr.mp3).
     # The deployment only contains two files:

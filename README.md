@@ -88,3 +88,8 @@ Use `journalctl -u bilal-beapp.service -f` to follow Gunicorn/server logs (they 
 
 Quick links
 - `CODE_OF_CONDUCT.md`: Operational rules, defaults, fallbacks, testing isolation, and safe service handling.
+
+Audio systems setting
+---------------------
+The server now stores an `enabled_audio_systems` setting in the SQLite `settings` table as a JSON array (for example: `["onboard"]` or `["onboard","sonos"]`).
+Default behavior is `["onboard"]`. When `sonos` is not enabled, the server will not attempt Sonos discovery or control, preventing unnecessary network scans. Change this setting from the frontend Settings tab.

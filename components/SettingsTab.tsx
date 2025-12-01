@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 
 const SettingsTab: React.FC<{ addLog: (level:string, msg:string)=>void; refreshSchedule: ()=>void }> = ({ addLog, refreshSchedule }) => {
   const [settings, setSettings] = useState<any>({});
+  const [enabledAudioSystems, setEnabledAudioSystems] = useState<string[]>([]);
   const [audioFiles, setAudioFiles] = useState<any[]>([]);
   const [fileInput, setFileInput] = useState<File | null>(null);
   const [qariName, setQariName] = useState('');
@@ -13,6 +14,9 @@ const SettingsTab: React.FC<{ addLog: (level:string, msg:string)=>void; refreshS
         if (!res.ok) return;
         const data = await res.json();
         setSettings(data);
+        if (data && data.enabled_audio_systems) {
+          setEnabledAudioSystems(data.enabled_audio_systems);
+        }
       } catch (e) {
         // ignore
       }
@@ -37,7 +41,8 @@ const SettingsTab: React.FC<{ addLog: (level:string, msg:string)=>void; refreshS
       // include passcode if stored in localStorage
       const pass = localStorage.getItem('bilal:passcode');
       if (pass) headers['X-BILAL-PASSCODE'] = pass;
-      const res = await fetch('/api/settings', { method: 'POST', headers, body: JSON.stringify(settings) });
+      const payload = Object.assign({}, settings, { enabled_audio_systems: enabledAudioSystems });
+      const res = await fetch('/api/settings', { method: 'POST', headers, body: JSON.stringify(payload) });
       if (res.ok) {
         addLog('SUCCESS', 'Production settings saved');
         try { refreshSchedule(); } catch(e){}
@@ -114,6 +119,25 @@ const SettingsTab: React.FC<{ addLog: (level:string, msg:string)=>void; refreshS
       </div>
       <div className="flex gap-2">
         <button onClick={saveSettings} className="px-4 py-2 bg-emerald-600 rounded">Save Production Settings</button>
+      </div>
+
+      <div className="mt-4">
+        <div className="text-sm font-medium text-slate-300 mb-2">Enabled Audio Systems</div>
+        {(['onboard','sonos','toa'] as const).map(sys => (
+          <label key={sys} className="flex items-center space-x-2">
+            <input
+              type="checkbox"
+              checked={enabledAudioSystems.includes(sys)}
+              onChange={() => {
+                setEnabledAudioSystems(prev => {
+                  if (prev.includes(sys)) return prev.filter(x => x !== sys);
+                  return [...prev, sys];
+                });
+              }}
+            />
+            <span className="capitalize text-sm">{sys}</span>
+          </label>
+        ))}
       </div>
 
       <div className="mt-4 border-t border-slate-800 pt-4">

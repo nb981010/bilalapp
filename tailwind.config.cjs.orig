@@ -1,0 +1,63 @@
+/** @type {import('tailwindcss').Config} */
+console.log('Loading tailwind.config.cjs');
+
+const SAFELIST = [
+  'bg-red-500',
+  'text-center',
+  'bg-slate-800',
+  'bg-slate-900',
+  'border-slate-600',
+  'border-slate-700',
+  'text-slate-200',
+  'text-slate-300',
+  'text-slate-400',
+  'text-emerald-50',
+  'text-emerald-400',
+  'bg-emerald-600',
+  'bg-emerald-900',
+  'rounded-xl',
+  'rounded-2xl',
+  'p-2',
+  'p-3',
+  'p-4',
+  'px-4',
+  'py-2',
+  'shadow-xl',
+  'shadow-2xl',
+  'hover:border-emerald-500/50',
+  'hover:bg-slate-700',
+  'hover:bg-slate-800/50',
+  { pattern: /bg-slate-(?:[0-9]{2,3})(?:\/\d+)?/ },
+  { pattern: /border-slate-(?:[0-9]{2,3})/ },
+  { pattern: /text-slate-(?:[0-9]{2,3})/ },
+  { pattern: /bg-emerald-(?:[0-9]{2,3})(?:\/\d+)?/ },
+  { pattern: /border-emerald-(?:[0-9]{2,3})/ },
+  { pattern: /rounded-(?:xl|2xl|full|lg|md)/ }
+];
+
+module.exports = {
+  content: [
+    './index.html',
+    './src/**/*.{js,ts,jsx,tsx}',
+    './components/**/*.{js,ts,jsx,tsx}',
+    './**/*.{js,ts,jsx,tsx,html}'
+  ],
+  // Keep the top-level safelist (newer Tailwind versions)
+  safelist: SAFELIST,
+  // For compatibility with older Tailwind versions/plugins, also provide purge.options.safelist
+  purge: {
+    content: [
+      './index.html',
+      './src/**/*.{js,ts,jsx,tsx}',
+      './components/**/*.{js,ts,jsx,tsx}',
+      './**/*.{js,ts,jsx,tsx,html}'
+    ],
+    options: {
+      safelist: SAFELIST
+    }
+  },
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+}
