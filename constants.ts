@@ -59,8 +59,8 @@ echo "Installing Python libraries (soco, flask)..."
 sudo pip3 install soco flask --break-system-packages 2>/dev/null || sudo pip3 install soco flask
 
 # 5. Create Systemd Service
-echo "Creating background service (bilal.service)..."
-SERVICE_FILE="/etc/systemd/system/bilal.service"
+echo "Creating background service (bilalapp.main.service)..."
+SERVICE_FILE="/etc/systemd/system/bilalapp.main.service"
 
 sudo bash -c "cat > $SERVICE_FILE" <<EOL
 [Unit]
@@ -84,13 +84,13 @@ EOL
 # 6. Enable and Start Service
 echo "Enabling and starting service..."
 sudo systemctl daemon-reload
-sudo systemctl enable bilal.service
-sudo systemctl restart bilal.service
+sudo systemctl enable bilalapp.main.service
+sudo systemctl restart bilalapp.main.service || true
 
 echo "--- Installation Complete ---"
 echo "App Directory: $APP_DIR"
 echo "Service User:  $REAL_USER"
 echo ""
 echo "Checking Service Status..."
-sudo systemctl status bilal.service --no-pager
+sudo systemctl status bilalapp.main.service --no-pager
 `;

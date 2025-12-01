@@ -258,7 +258,7 @@ def api_prayer_times():
             env = os.environ.copy()
             env['TZ'] = 'Asia/Dubai'
             p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True, env=env)
-            out, err = p.communicate(timeout=5)
+            out, err = p.communicate(timeout=15)
             if p.returncode == 0 and out:
                 try:
                     return jsonify(json.loads(out))
@@ -570,7 +570,7 @@ def schedule_prayers_for_date(target_date: date):
                 env = os.environ.copy()
                 env['TZ'] = 'Asia/Dubai'
                 p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True, env=env)
-                out, err = p.communicate(timeout=5)
+                out, err = p.communicate(timeout=15)
                 if p.returncode == 0 and out:
                     try:
                         node_data = json.loads(out)
@@ -662,7 +662,7 @@ def schedule_prayers_for_date(target_date: date):
             filename = 'fajr.mp3' if key == 'fajr' else 'azan.mp3'
             # Use textual reference for the callable so APScheduler can serialize jobs
             # when using a persistent jobstore (e.g., SQLAlchemyJobStore).
-            scheduler.add_job('server:_http_post_play', trigger=DateTrigger(run_date=scheduled_dt), args=[filename], id=job_id)
+            scheduler.add_job('server._http_post_play', trigger=DateTrigger(run_date=scheduled_dt), args=[filename], id=job_id)
             scheduled_count += 1
     except Exception as e:
         logger.error(f"Failed to schedule prayers for {target_date}: {e}")
@@ -694,7 +694,7 @@ def compute_prayer_jobs_for_date(settings: dict, target_date: date):
                 env = os.environ.copy()
                 env['TZ'] = 'Asia/Dubai'
                 p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True, env=env)
-                out, err = p.communicate(timeout=5)
+                out, err = p.communicate(timeout=15)
                 if p.returncode == 0 and out:
                     try:
                         node_data = json.loads(out)

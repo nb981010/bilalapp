@@ -32,11 +32,11 @@ sudoedit /etc/default/bilal
 ./install.sh --service --user bilal --force-env
 ```
 
-4. Start and check status:
+4. Start and check status (use the umbrella unit `bilalapp.main.service`):
 
 ```bash
-sudo systemctl start bilal.service
-sudo systemctl status bilal.service
+sudo systemctl start bilalapp.main.service
+sudo systemctl status bilalapp.main.service
 ```
 
 Notes

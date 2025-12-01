@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # Behavior:
 #  - Ensures ports are free (kills processes listening on configured ports)
-#  - Stops/starts the systemd service `bilal.service` (uses sudo)
+#  - Stops/starts the systemd service `bilalapp.main.service` (uses `systemctl`)
 #  - Optionally starts/stops the frontend dev server (`npm run dev`) in background
 #
 
@@ -16,7 +16,12 @@ FRONTEND_PID_FILE="$ROOT_DIR/.frontend.pid"
 FRONTEND_LOG="$LOG_DIR/frontend.log"
 
 PORTS=(5000 5173)
-SERVICE_NAME="bilal.service"
+# Default service to manage. Can be overridden by setting SERVICE_NAME in the
+# environment before invoking this script (e.g. `SERVICE_NAME=bilalapp.main.service ./manage_bilal.sh restart`).
+SERVICE_NAME="${SERVICE_NAME:-bilalapp.main.service}"
+
+# Additional related units we may report status for if present on the system
+RELATED_UNITS=("bilalapp.main.service" "bilalapp.be.service" "bilalapp.fe.service")
 
 ensure_logs_dir() {
   mkdir -p "$LOG_DIR"
@@ -92,20 +97,20 @@ start_frontend() {
 stop_service() {
   echo "Stopping systemd service $SERVICE_NAME (if active)"
   if systemctl is-active --quiet "$SERVICE_NAME"; then
-    sudo systemctl stop "$SERVICE_NAME"
+    systemctl stop "$SERVICE_NAME"
     sleep 1
   fi
 }
 
 start_service() {
   echo "Starting systemd service $SERVICE_NAME"
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now "$SERVICE_NAME"
+  systemctl daemon-reload
+  systemctl enable --now "$SERVICE_NAME"
 }
 
 status() {
   echo "=== Service status ==="
-  sudo systemctl status "$SERVICE_NAME" --no-pager || true
+  systemctl status "$SERVICE_NAME" --no-pager || true
   echo
   echo "=== Listening processes on configured ports ==="
   for p in "${PORTS[@]}"; do
@@ -115,6 +120,12 @@ status() {
   if [ -f "$FRONTEND_PID_FILE" ]; then
     echo "Frontend PID file: $(cat $FRONTEND_PID_FILE)" || true
   fi
+  # Also show status for related units if they exist
+  for u in "${RELATED_UNITS[@]}"; do
+    echo
+    echo "=== Status for $u (if present) ==="
+    systemctl status "$u" --no-pager || true
+  done
 }
 
 do_start() {
@@ -142,7 +153,7 @@ do_start() {
     start_frontend
   fi
 
-  echo "Start sequence complete. Check logs with: sudo journalctl -u $SERVICE_NAME -f";
+  echo "Start sequence complete. Check logs with: journalctl -u $SERVICE_NAME -f";
 }
 
 do_stop() {

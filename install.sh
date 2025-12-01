@@ -10,7 +10,7 @@ set -euo pipefail
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$APP_DIR/.venv"
 DB_PATH="$APP_DIR/bilal_jobs.sqlite"
-SERVICE_NAME="bilal.service"
+SERVICE_NAME="bilalapp.main.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE_NAME"
 
 usage(){
@@ -156,6 +156,7 @@ VENV_DIR=$VENV_DIR
 ENV
   fi
 
+[ -n "$SERVICE_PATH" ] || true
   echo "Creating systemd unit at $SERVICE_PATH (requires sudo)"
   sudo tee "$SERVICE_PATH" > /dev/null <<UNIT
 [Unit]
