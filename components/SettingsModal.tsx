@@ -49,6 +49,13 @@ const SettingsModal: React.FC<Props> = ({ isOpen, onClose, addLog, setZones, ref
   const [adhanMode, setAdhanMode] = useState<'online'|'offline'>('online');
   const [sonosMode, setSonosMode] = useState<'online'|'offline'>('online');
 
+  // Audio system toggles and priority
+  const [sonosEnabled, setSonosEnabled] = useState<boolean>(true);
+  const [toaEnabled, setToaEnabled] = useState<boolean>(false);
+  const [audioPriority, setAudioPriority] = useState<'online_first'|'offline_first'>('online_first');
+  const [discoveredZones, setDiscoveredZones] = useState<any[]>([]);
+  const [enabledZones, setEnabledZones] = useState<string[]>([]);
+
   // Testing state
   const [env, setEnv] = useState<string>('simulate');
   const [testFile, setTestFile] = useState<string>('azan.mp3');

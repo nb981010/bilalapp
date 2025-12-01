@@ -12,7 +12,6 @@ import { getPrayerTimes, getNextPrayer } from './services/prayerService.ts';
 import LogsViewer from './components/LogsViewer.tsx';
 import ZoneGrid from './components/ZoneGrid.tsx';
 // Removed legacy SettingsModal import — using full-page Settings/Test routes
-import SettingsTab from './components/SettingsTab.tsx';
 import TestTab from './components/TestTab.tsx';
 import SettingsPage from './pages/SettingsPage';
 import TestPage from './pages/TestPage';

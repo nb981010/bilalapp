@@ -1003,7 +1003,11 @@ def api_settings():
                 'asr_madhab': 'Shafi',
                 'css_mode': 'online',
                 'adhan_mode': 'online',
-                'sonos_mode': 'online'
+                'sonos_mode': 'online',
+                'sonos_enabled': 'true',
+                'toa_enabled': 'false',
+                'audio_priority': 'online_first',
+                'enabled_zones': '[]'
             }
             for k, v in defaults.items():
                 data.setdefault(k, v)
@@ -1057,7 +1061,12 @@ def api_test_settings():
                 'asr_madhab': 'Shafi',
                 'css_mode': 'online',
                 'adhan_mode': 'online',
-                'sonos_mode': 'online'
+                'sonos_mode': 'online',
+                # New audio system settings
+                'sonos_enabled': 'true',
+                'toa_enabled': 'false',
+                'audio_priority': 'online_first',
+                'enabled_zones': '[]'
             }
             for k, v in defaults.items():
                 data.setdefault(k, v)
@@ -1330,7 +1339,60 @@ def play_audio():
         tz = None
 
     try:
-        # Prefer cloud control, fallback to local SoCo
+        # Load audio-related settings and decide which systems to use
+        try:
+            settings = _read_settings_table(test=False)
+        except Exception:
+            settings = {}
+        sonos_enabled = str(settings.get('sonos_enabled', 'true')).lower() in ('1', 'true', 'yes')
+        toa_enabled = str(settings.get('toa_enabled', 'false')).lower() in ('1', 'true', 'yes')
+        audio_priority = settings.get('audio_priority', 'online_first') or 'online_first'
+        enabled_zones_raw = settings.get('enabled_zones', '[]')
+        try:
+            enabled_zones_list = json.loads(enabled_zones_raw) if isinstance(enabled_zones_raw, str) else enabled_zones_raw
+            enabled_zone_set = set([str(x) for x in (enabled_zones_list or [])])
+        except Exception:
+            enabled_zone_set = set()
+
+        # If Sonos is disabled, but TOA is enabled, use TOA (dummy) and return success
+        if not sonos_enabled:
+            if toa_enabled:
+                logger.info('Sonos disabled; using TOA (dummy) for playback')
+                try:
+                    _append_play_history(filename, when=datetime.now(tz))
+                except Exception:
+                    pass
+                return jsonify({'status': 'success', 'message': 'Playback started (TOA)', 'mode': 'toa'})
+            else:
+                logger.error('No audio systems enabled')
+                return jsonify({"status": "error", "message": "No audio systems enabled"}), 503
+
+        # Prefer cloud control, fallback to local SoCo (but respect audio_priority)
+        def pick_device_from_list(devices):
+            if not devices:
+                return None
+            # If no enabled_zones specified, return first
+            if not enabled_zone_set:
+                return devices[0]
+            # Try to match by common id/name keys
+            for device in devices:
+                did = None
+                if isinstance(device, dict):
+                    for k in ('id', 'playerId', 'player_id', 'uid', 'playerID', 'name', 'player_name'):
+                        v = device.get(k)
+                        if v:
+                            did = str(v)
+                            break
+                else:
+                    try:
+                        did = str(getattr(device, 'uid', None) or getattr(device, 'id', None) or getattr(device, 'playerId', None) or getattr(device, 'player_name', None))
+                    except Exception:
+                        did = None
+                if did and did in enabled_zone_set:
+                    return device
+            # fallback
+            return devices[0]
+
         def cloud_action(cloud_url):
             # cloud microservice expects device_id and url; here we use coordinator discovery to find first cloud-device
             # For simplicity, we call cloud discover and pick the first player id (if any) and then play
@@ -1341,7 +1403,7 @@ def play_audio():
             # data expected to be list of players
             if not data:
                 raise Exception('no cloud devices')
-            device = data[0]
+            device = pick_device_from_list(data)
             # Normalize device id selection from a variety of possible keys returned
             device_id = None
             if isinstance(device, dict):
@@ -1373,16 +1435,46 @@ def play_audio():
             devices = r.json()
             if not devices:
                 raise Exception('no local devices')
-            # pick first device name
-            name = devices[0].get('name')
+            # pick device (respect enabled_zones if configured)
+            device = pick_device_from_list(devices)
+            name = None
+            if isinstance(device, dict):
+                name = device.get('name') or device.get('player_name') or device.get('playerName')
+            else:
+                try:
+                    name = getattr(device, 'player_name', None)
+                except Exception:
+                    name = None
+            if not name and devices:
+                name = devices[0].get('name') if isinstance(devices[0], dict) else None
             local_ip = get_local_ip()
             audio_url = f"http://{local_ip}:5000/audio/{filename}"
             pr = requests.post(f"{local_url}/local/play", json={'device_name': name, 'url': audio_url}, timeout=5)
             if pr.status_code not in (200, 204):
                 raise Exception('local play failed')
             return {'status': 'ok', 'mode': 'local'}
-
-        result = control_with_fallback(cloud_action, local_action)
+        # Decide order based on audio_priority
+        cloud_url = os.environ.get('SONOS_CLOUD_URL', 'http://127.0.0.1:6000')
+        local_url = os.environ.get('SOCO_LOCAL_URL', 'http://127.0.0.1:5001')
+        result = None
+        if audio_priority == 'offline_first':
+            try:
+                result = local_action(local_url)
+            except Exception as e:
+                logger.warning(f"Local action failed (offline_first): {e}; trying cloud")
+                try:
+                    result = cloud_action(cloud_url)
+                except Exception as e2:
+                    logger.warning(f"Cloud action also failed: {e2}")
+        else:
+            try:
+                result = cloud_action(cloud_url)
+            except Exception as e:
+                logger.warning(f"Cloud action failed: {e}; falling back to local SoCo")
+                try:
+                    result = local_action(local_url)
+                except Exception as e2:
+                    logger.error(f"Local action failed: {e2}")
         # If cloud/local handled playback, return success
         if result and result.get('status') == 'ok':
             return jsonify({'status': 'success', 'message': 'Playback Started', 'mode': result.get('mode')})

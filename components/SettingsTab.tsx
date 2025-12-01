@@ -5,6 +5,12 @@ const SettingsTab: React.FC<{ addLog: (level:string, msg:string)=>void; refreshS
   const [audioFiles, setAudioFiles] = useState<any[]>([]);
   const [fileInput, setFileInput] = useState<File | null>(null);
   const [qariName, setQariName] = useState('');
+  // Audio system UI state
+  const [sonosEnabled, setSonosEnabled] = useState<boolean>(true);
+  const [toaEnabled, setToaEnabled] = useState<boolean>(false);
+  const [audioPriority, setAudioPriority] = useState<'online_first'|'offline_first'>('online_first');
+  const [discoveredZones, setDiscoveredZones] = useState<any[]>([]);
+  const [enabledZones, setEnabledZones] = useState<string[]>([]);
 
   useEffect(() => {
     (async () => {
@@ -13,10 +19,28 @@ const SettingsTab: React.FC<{ addLog: (level:string, msg:string)=>void; refreshS
         if (!res.ok) return;
         const data = await res.json();
         setSettings(data);
+        // load new audio-related settings
+        if (typeof data.sonos_enabled !== 'undefined') setSonosEnabled(String(data.sonos_enabled) === 'true' || data.sonos_enabled === true);
+        if (typeof data.toa_enabled !== 'undefined') setToaEnabled(String(data.toa_enabled) === 'true' || data.toa_enabled === true);
+        if (data.audio_priority) setAudioPriority(data.audio_priority === 'offline_first' ? 'offline_first' : 'online_first');
+        try {
+          if (data.enabled_zones) {
+            const ez = typeof data.enabled_zones === 'string' ? JSON.parse(data.enabled_zones) : data.enabled_zones;
+            if (Array.isArray(ez)) setEnabledZones(ez.map((x:any)=>String(x)));
+          }
+        } catch (e) {}
       } catch (e) {
         // ignore
       }
       fetchAudioList();
+      // fetch zones for enable/disable UI
+      try {
+        const rz = await fetch('/api/zones');
+        if (rz.ok) {
+          const zd = await rz.json();
+          setDiscoveredZones(zd || []);
+        }
+      } catch (e) {}
     })();
   }, []);
 
@@ -37,7 +61,14 @@ const SettingsTab: React.FC<{ addLog: (level:string, msg:string)=>void; refreshS
       // include passcode if stored in localStorage
       const pass = localStorage.getItem('bilal:passcode');
       if (pass) headers['X-BILAL-PASSCODE'] = pass;
-      const res = await fetch('/api/settings', { method: 'POST', headers, body: JSON.stringify(settings) });
+      // include our audio-specific keys in the payload
+      const payload = Object.assign({}, settings, {
+        sonos_enabled: sonosEnabled,
+        toa_enabled: toaEnabled,
+        audio_priority: audioPriority,
+        enabled_zones: JSON.stringify(enabledZones || [])
+      });
+      const res = await fetch('/api/settings', { method: 'POST', headers, body: JSON.stringify(payload) });
       if (res.ok) {
         addLog('SUCCESS', 'Production settings saved');
         try { refreshSchedule(); } catch(e){}
@@ -114,6 +145,65 @@ const SettingsTab: React.FC<{ addLog: (level:string, msg:string)=>void; refreshS
       </div>
       <div className="flex gap-2">
         <button onClick={saveSettings} className="px-4 py-2 bg-emerald-600 rounded">Save Production Settings</button>
+      </div>
+
+      <div className="mt-4 border-t border-slate-800 pt-4">
+        <h3 className="font-semibold">Audio Systems</h3>
+        <div className="space-y-3 mt-3">
+          <div className="flex items-center justify-between bg-slate-800 p-2 rounded">
+            <div>
+              <div className="font-medium">Sonos</div>
+              <div className="text-xs text-slate-400">Enable Sonos control (cloud/local)</div>
+            </div>
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input type="checkbox" className="sr-only peer" checked={sonosEnabled} onChange={e=>setSonosEnabled(e.target.checked)} />
+              <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:bg-emerald-500 transition-colors" />
+              <span className={`ml-3 text-sm ${sonosEnabled ? 'text-white' : 'text-slate-400'}`}>{sonosEnabled ? 'On' : 'Off'}</span>
+            </label>
+          </div>
+
+          <div className="flex items-center justify-between bg-slate-800 p-2 rounded">
+            <div>
+              <div className="font-medium">TOA (amplifier)</div>
+              <div className="text-xs text-slate-400">Static/dummy config for TOA (no discovery yet)</div>
+            </div>
+            <label className="relative inline-flex items-center cursor-pointer">
+              <input type="checkbox" className="sr-only peer" checked={toaEnabled} onChange={e=>setToaEnabled(e.target.checked)} />
+              <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:bg-emerald-500 transition-colors" />
+              <span className={`ml-3 text-sm ${toaEnabled ? 'text-white' : 'text-slate-400'}`}>{toaEnabled ? 'On' : 'Off'}</span>
+            </label>
+          </div>
+
+          <div>
+            <label className="text-xs text-slate-400">Discovery Priority</label>
+            <select value={audioPriority} onChange={e=>setAudioPriority(e.target.value as any)} className="p-2 bg-slate-800 rounded w-full mt-1">
+              <option value="online_first">Online API First (default)</option>
+              <option value="offline_first">Offline/Local First</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="text-xs text-slate-400">Enable Zones</label>
+            <div className="mt-2 max-h-48 overflow-y-auto space-y-2">
+              {discoveredZones.map(z => (
+                <div key={z.id} className="flex items-center justify-between bg-slate-800 p-2 rounded">
+                  <div>
+                    <div className="font-medium">{z.name}</div>
+                    <div className="text-xs text-slate-400">{z.isAvailable ? 'Available' : 'Offline'}</div>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input type="checkbox" className="sr-only peer" checked={enabledZones.includes(String(z.id))} onChange={e => {
+                      const id = String(z.id);
+                      if (e.target.checked) setEnabledZones(prev => Array.from(new Set([...(prev||[]), id])));
+                      else setEnabledZones(prev => (prev||[]).filter(x=>x!==id));
+                    }} />
+                    <div className="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:bg-emerald-500 transition-colors" />
+                  </label>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
       </div>
 
       <div className="mt-4 border-t border-slate-800 pt-4">
