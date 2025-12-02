@@ -662,7 +662,7 @@ def schedule_prayers_for_date(target_date: date):
             filename = 'fajr.mp3' if key == 'fajr' else 'azan.mp3'
             # Use textual reference for the callable so APScheduler can serialize jobs
             # when using a persistent jobstore (e.g., SQLAlchemyJobStore).
-            scheduler.add_job('server:_http_post_play', trigger=DateTrigger(run_date=scheduled_dt), args=[filename], id=job_id, misfire_grace_time=1)
+            scheduler.add_job('server._http_post_play', trigger=DateTrigger(run_date=scheduled_dt), args=[filename], id=job_id)
             scheduled_count += 1
     except Exception as e:
         logger.error(f"Failed to schedule prayers for {target_date}: {e}")
@@ -840,6 +840,20 @@ def list_scheduled_jobs():
     return jsonify({'available': True, 'jobs': jobs})
 
 
+@app.route('/api/play/history', methods=['GET'])
+def api_play_history():
+    """Return recent play history entries from the backend (file, ts).
+
+    This endpoint is used by the frontend to infer whether scheduled prayers
+    were played (success) or missed (failed).
+    """
+    try:
+        recent = read_recent_play_history(100)
+    except Exception:
+        recent = []
+    return jsonify({'status': 'ok', 'history': recent})
+
+
 @app.route('/api/scheduler/force-schedule', methods=['POST'])
 def api_force_schedule_today():
     """Force a run of today's scheduling (useful for testing). Returns number of jobs scheduled."""
@@ -985,49 +999,6 @@ def api_test_play():
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
-@app.route('/api/test/schedule-past', methods=['POST'])
-def api_test_schedule_past():
-    """Test helper: schedule a DateTrigger in the past with misfire_grace_time=0.
-
-    POST JSON: {"seconds_in_past": 60, "file": "azan.mp3", "id": "optional-id"}
-    Returns job metadata and whether it's considered missed/skipped.
-    """
-    try:
-        if not SCHEDULER_AVAILABLE or not scheduler:
-            return jsonify({'status': 'error', 'message': 'Scheduler not available'}), 400
-        data = request.get_json(silent=True) or {}
-        secs = int(data.get('seconds_in_past', 60))
-        fname = (data.get('file') or 'azan.mp3').strip()
-        jid = data.get('id') or f"test-past-{int(time.time())}"
-        try:
-            tz = get_prayer_tz()
-        except Exception:
-            tz = None
-        when = datetime.now(tz) - timedelta(seconds=secs)
-        # Force-add job in the past with zero misfire grace so it will not run late.
-            try:
-                scheduler.add_job('server:_http_post_play', trigger=DateTrigger(run_date=when), args=[fname], id=jid, misfire_grace_time=1)
-        except Exception as e:
-            return jsonify({'status': 'error', 'message': f'Failed to add job: {e}'}), 500
-
-        # Inspect job
-        try:
-            j = scheduler.get_job(jid)
-            nrt = j.next_run_time
-            now = datetime.now(tz)
-            if nrt is None or (nrt and nrt <= now):
-                status = 'missed_or_skipped'
-            else:
-                status = 'scheduled'
-            nrt_str = nrt.isoformat() if nrt is not None else None
-            return jsonify({'status': 'ok', 'job_id': jid, 'next_run_time': nrt_str, 'result': status})
-        except Exception as e:
-            return jsonify({'status': 'error', 'message': f'Failed to inspect job: {e}'}), 500
-    except Exception as e:
-        logger.error(f"schedule-past error: {e}")
-        return jsonify({'status': 'error', 'message': str(e)}), 500
-
-
 @app.route('/api/settings', methods=['GET', 'POST'])
 def api_settings():
     """Get or update production settings stored in DB.
@@ -1046,7 +1017,11 @@ def api_settings():
                 'asr_madhab': 'Shafi',
                 'css_mode': 'online',
                 'adhan_mode': 'online',
-                'sonos_mode': 'online'
+                'sonos_mode': 'online',
+                'sonos_enabled': 'true',
+                'toa_enabled': 'false',
+                'audio_priority': 'online_first',
+                'enabled_zones': '[]'
             }
             for k, v in defaults.items():
                 data.setdefault(k, v)
@@ -1100,7 +1075,12 @@ def api_test_settings():
                 'asr_madhab': 'Shafi',
                 'css_mode': 'online',
                 'adhan_mode': 'online',
-                'sonos_mode': 'online'
+                'sonos_mode': 'online',
+                # New audio system settings
+                'sonos_enabled': 'true',
+                'toa_enabled': 'false',
+                'audio_priority': 'online_first',
+                'enabled_zones': '[]'
             }
             for k, v in defaults.items():
                 data.setdefault(k, v)
@@ -1373,7 +1353,60 @@ def play_audio():
         tz = None
 
     try:
-        # Prefer cloud control, fallback to local SoCo
+        # Load audio-related settings and decide which systems to use
+        try:
+            settings = _read_settings_table(test=False)
+        except Exception:
+            settings = {}
+        sonos_enabled = str(settings.get('sonos_enabled', 'true')).lower() in ('1', 'true', 'yes')
+        toa_enabled = str(settings.get('toa_enabled', 'false')).lower() in ('1', 'true', 'yes')
+        audio_priority = settings.get('audio_priority', 'online_first') or 'online_first'
+        enabled_zones_raw = settings.get('enabled_zones', '[]')
+        try:
+            enabled_zones_list = json.loads(enabled_zones_raw) if isinstance(enabled_zones_raw, str) else enabled_zones_raw
+            enabled_zone_set = set([str(x) for x in (enabled_zones_list or [])])
+        except Exception:
+            enabled_zone_set = set()
+
+        # If Sonos is disabled, but TOA is enabled, use TOA (dummy) and return success
+        if not sonos_enabled:
+            if toa_enabled:
+                logger.info('Sonos disabled; using TOA (dummy) for playback')
+                try:
+                    _append_play_history(filename, when=datetime.now(tz))
+                except Exception:
+                    pass
+                return jsonify({'status': 'success', 'message': 'Playback started (TOA)', 'mode': 'toa'})
+            else:
+                logger.error('No audio systems enabled')
+                return jsonify({"status": "error", "message": "No audio systems enabled"}), 503
+
+        # Prefer cloud control, fallback to local SoCo (but respect audio_priority)
+        def pick_device_from_list(devices):
+            if not devices:
+                return None
+            # If no enabled_zones specified, return first
+            if not enabled_zone_set:
+                return devices[0]
+            # Try to match by common id/name keys
+            for device in devices:
+                did = None
+                if isinstance(device, dict):
+                    for k in ('id', 'playerId', 'player_id', 'uid', 'playerID', 'name', 'player_name'):
+                        v = device.get(k)
+                        if v:
+                            did = str(v)
+                            break
+                else:
+                    try:
+                        did = str(getattr(device, 'uid', None) or getattr(device, 'id', None) or getattr(device, 'playerId', None) or getattr(device, 'player_name', None))
+                    except Exception:
+                        did = None
+                if did and did in enabled_zone_set:
+                    return device
+            # fallback
+            return devices[0]
+
         def cloud_action(cloud_url):
             # cloud microservice expects device_id and url; here we use coordinator discovery to find first cloud-device
             # For simplicity, we call cloud discover and pick the first player id (if any) and then play
@@ -1384,7 +1417,7 @@ def play_audio():
             # data expected to be list of players
             if not data:
                 raise Exception('no cloud devices')
-            device = data[0]
+            device = pick_device_from_list(data)
             # Normalize device id selection from a variety of possible keys returned
             device_id = None
             if isinstance(device, dict):
@@ -1416,16 +1449,46 @@ def play_audio():
             devices = r.json()
             if not devices:
                 raise Exception('no local devices')
-            # pick first device name
-            name = devices[0].get('name')
+            # pick device (respect enabled_zones if configured)
+            device = pick_device_from_list(devices)
+            name = None
+            if isinstance(device, dict):
+                name = device.get('name') or device.get('player_name') or device.get('playerName')
+            else:
+                try:
+                    name = getattr(device, 'player_name', None)
+                except Exception:
+                    name = None
+            if not name and devices:
+                name = devices[0].get('name') if isinstance(devices[0], dict) else None
             local_ip = get_local_ip()
             audio_url = f"http://{local_ip}:5000/audio/{filename}"
             pr = requests.post(f"{local_url}/local/play", json={'device_name': name, 'url': audio_url}, timeout=5)
             if pr.status_code not in (200, 204):
                 raise Exception('local play failed')
             return {'status': 'ok', 'mode': 'local'}
-
-        result = control_with_fallback(cloud_action, local_action)
+        # Decide order based on audio_priority
+        cloud_url = os.environ.get('SONOS_CLOUD_URL', 'http://127.0.0.1:6000')
+        local_url = os.environ.get('SOCO_LOCAL_URL', 'http://127.0.0.1:5001')
+        result = None
+        if audio_priority == 'offline_first':
+            try:
+                result = local_action(local_url)
+            except Exception as e:
+                logger.warning(f"Local action failed (offline_first): {e}; trying cloud")
+                try:
+                    result = cloud_action(cloud_url)
+                except Exception as e2:
+                    logger.warning(f"Cloud action also failed: {e2}")
+        else:
+            try:
+                result = cloud_action(cloud_url)
+            except Exception as e:
+                logger.warning(f"Cloud action failed: {e}; falling back to local SoCo")
+                try:
+                    result = local_action(local_url)
+                except Exception as e2:
+                    logger.error(f"Local action failed: {e2}")
         # If cloud/local handled playback, return success
         if result and result.get('status') == 'ok':
             return jsonify({'status': 'success', 'message': 'Playback Started', 'mode': result.get('mode')})

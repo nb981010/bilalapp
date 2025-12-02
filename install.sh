@@ -1,6 +1,182 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# idempotent installer for bilalapp
+# - deploys code to /opt/bilalapp (or custom $DEPLOY)
+# - creates service user
+# - creates python venv and installs requirements
+# - installs systemd unit files for backend/frontend and an env file
+# - enables & starts services
+
+APP="bilalapp"
+DEPLOY="/opt/$APP"
+SERVICE_USER="bilal"
+ENV_DIR="/etc/$APP"
+ENV_FILE="$ENV_DIR/env"
+SRC_DIR="${SRC_DIR:-$(pwd)}"
+PYTHON_BIN="python3"
+
+echo "Bilal App installer"
+echo "Source directory: $SRC_DIR"
+echo "Deploy directory: $DEPLOY"
+
+require_sudo() {
+  if [ "$EUID" -ne 0 ]; then
+    echo "This installer requires sudo for system operations. Re-run as root or allow sudo when prompted."
+  fi
+}
+
+ensure_user() {
+  if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+    echo "Creating service user: $SERVICE_USER"
+    sudo useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER" || true
+  else
+    echo "Service user $SERVICE_USER already exists"
+  fi
+}
+
+backup_if_exists() {
+  local path="$1"
+  if [ -e "$path" ]; then
+    local b="$path.bak.$(date +%s)"
+    echo "Backing up $path → $b"
+    sudo cp -a "$path" "$b"
+  fi
+}
+
+deploy_code() {
+  echo "Deploying code from $SRC_DIR to $DEPLOY"
+  sudo mkdir -p "$DEPLOY"
+  # sync; exclude virtualenv, node_modules and logs by default
+  sudo rsync -a --delete --exclude='.venv' --exclude='node_modules' --exclude='logs' "$SRC_DIR/" "$DEPLOY/"
+  sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$DEPLOY"
+}
+
+create_venv_and_install() {
+  echo "Creating virtualenv and installing Python dependencies"
+  # create venv if missing
+  if [ ! -d "$DEPLOY/.venv" ]; then
+    sudo -u "$SERVICE_USER" $PYTHON_BIN -m venv "$DEPLOY/.venv"
+    sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$DEPLOY/.venv"
+  else
+    echo ".venv already exists at $DEPLOY/.venv"
+  fi
+
+  # Upgrade pip and install requirements if present
+  if [ -f "$DEPLOY/requirements.txt" ]; then
+    echo "Installing Python requirements (may take a while)"
+    sudo -u "$SERVICE_USER" "$DEPLOY/.venv/bin/pip" install --upgrade pip setuptools wheel
+    sudo -u "$SERVICE_USER" "$DEPLOY/.venv/bin/pip" install -r "$DEPLOY/requirements.txt"
+  else
+    echo "No requirements.txt found; skipping pip install"
+  fi
+}
+
+write_env_file() {
+  echo "Writing environment file to $ENV_FILE"
+  sudo mkdir -p "$ENV_DIR"
+  # default values; users may override later
+  sudo tee "$ENV_FILE" >/dev/null <<EOF
+BILAL_DB_PATH=$DEPLOY/bilal_jobs.sqlite
+PRAYER_TZ=Asia/Dubai
+LOG_DIR=$DEPLOY/logs
+EOF
+  sudo chown root:root "$ENV_FILE"
+  sudo chmod 0640 "$ENV_FILE"
+}
+
+install_systemd_units() {
+  echo "Installing systemd unit files"
+
+  # backend unit
+  local be_unit=/etc/systemd/system/${APP}.be.service
+  backup_if_exists "$be_unit"
+  sudo tee "$be_unit" >/dev/null <<'EOF'
+[Unit]
+Description=Bilal Backend Service
+After=network.target
+
+[Service]
+Type=simple
+User=bilal
+WorkingDirectory=/opt/bilalapp
+EnvironmentFile=/etc/bilalapp/env
+ExecStart=/opt/bilalapp/.venv/bin/python3 /opt/bilalapp/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # frontend unit (optional; only if frontend static server or dev server used)
+  local fe_unit=/etc/systemd/system/${APP}.fe.service
+  backup_if_exists "$fe_unit"
+  sudo tee "$fe_unit" >/dev/null <<'EOF'
+[Unit]
+Description=Bilal Frontend Service
+After=network.target
+
+[Service]
+Type=simple
+User=bilal
+WorkingDirectory=/opt/bilalapp
+EnvironmentFile=/etc/bilalapp/env
+# Adjust this ExecStart if you host frontend differently (e.g. serve built files via nginx)
+ExecStart=/bin/true
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  sudo systemctl daemon-reload
+  # enable backend; frontend unit is a placeholder (enable if you replace ExecStart)
+  sudo systemctl enable --now ${APP}.be.service || true
+  sudo systemctl enable ${APP}.fe.service || true
+}
+
+setup_logrotate() {
+  echo "Installing logrotate config"
+  local lr=/etc/logrotate.d/${APP}
+  backup_if_exists "$lr"
+  sudo tee "$lr" >/dev/null <<EOF
+$DEPLOY/logs/*.log {
+  daily
+  rotate 14
+  compress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+}
+
+finalize() {
+  echo "Finalizing installation"
+  sudo mkdir -p $DEPLOY/logs
+  sudo chown -R "$SERVICE_USER":"$SERVICE_USER" "$DEPLOY"
+  echo "Installation complete. Check service status with: sudo systemctl status ${APP}.be.service"
+}
+
+main() {
+  require_sudo
+  ensure_user
+  deploy_code
+  create_venv_and_install
+  write_env_file
+  install_systemd_units
+  setup_logrotate
+  finalize
+}
+
+main "$@"
+
+# End of installer
+#!/usr/bin/env bash
+set -euo pipefail
+
 # Installer for Bilal app (repo-level `install.sh`).
 # - Creates a Python virtualenv in `.venv`
 # - Installs Python deps from `requirements.txt` (creates it if missing)
