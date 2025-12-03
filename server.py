@@ -20,7 +20,6 @@ try:
     from apscheduler.schedulers.background import BackgroundScheduler
     from apscheduler.triggers.date import DateTrigger
     from apscheduler.triggers.interval import IntervalTrigger
-    import praytimes
     from tzlocal import get_localzone
     import fcntl
     SCHEDULER_AVAILABLE = True
@@ -590,19 +589,11 @@ def schedule_prayers_for_date(target_date: date):
         except Exception as e:
             logger.warning(f"Failed to run node helper for prayer schedule: {e}")
 
-        # Fallback to Python praytimes if node helper did not produce times
+        # If Node helper did not produce times, do NOT fallback to Python algorithm.
+        # The codebase uses the Node `adhan` implementation for consistent prayer times.
         if times is None:
-            pt = praytimes.PrayTimes()
-            # praytimes expects a (year, month, day) tuple and a timezone offset in hours.
-            # Compute the local timezone offset for the target date (may include DST)
-            try:
-                local_dt = datetime(target_date.year, target_date.month, target_date.day, tzinfo=tz)
-                offset_td = local_dt.utcoffset() or timedelta(0)
-                tz_offset_hours = offset_td.total_seconds() / 3600.0
-            except Exception:
-                tz_offset_hours = 0
-            # Pass the computed offset so returned times are in local time
-            times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz_offset_hours)
+            logger.warning("Node prayertimes helper failed; not falling back to Python praytimes. No jobs will be scheduled for this date.")
+            times = {}
         prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
         # Load recent play history from SQLite
         try:
@@ -715,14 +706,8 @@ def compute_prayer_jobs_for_date(settings: dict, target_date: date):
 
         # Fallback to Python praytimes if node helper did not produce times
         if times is None:
-            try:
-                pt = praytimes.PrayTimes()
-                local_dt = datetime(target_date.year, target_date.month, target_date.day, tzinfo=tz)
-                offset_td = local_dt.utcoffset() or timedelta(0)
-                tz_offset_hours = offset_td.total_seconds() / 3600.0
-            except Exception:
-                tz_offset_hours = 0
-            times = pt.getTimes((target_date.year, target_date.month, target_date.day), (lat, lon), tz_offset_hours)
+            logger.warning("Node prayertimes helper failed; not falling back to Python praytimes. No jobs will be scheduled for this date.")
+            times = {}
 
         prayer_keys = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
         for key in prayer_keys:
