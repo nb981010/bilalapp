@@ -1,7 +1,8 @@
 flask
 soco
-praytimes
 schedule
+requests
+sqlalchemy
 python-dotenv
 gunicorn
 apscheduler
