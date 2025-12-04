@@ -1,7 +1,6 @@
 soco
 flask
 apscheduler
-praytimes
 tzlocal
 requests
 sqlalchemy

@@ -32,6 +32,13 @@ try:
 except Exception:
     SCHEDULER_AVAILABLE = False
     SCHEDULER_IMPORT_ERROR = None
+
+# Optional Python prayertimes library (deprecated fallback). Import only if available.
+try:
+    import praytimes
+    PRAYTIMES_AVAILABLE = True
+except Exception:
+    PRAYTIMES_AVAILABLE = False
     try:
         import traceback
         SCHEDULER_IMPORT_ERROR = traceback.format_exc()
@@ -269,6 +276,11 @@ def api_prayer_times():
         logger.warning(f"Failed to run node helper for prayertimes: {e}")
 
     # Fallback to existing praytimes calculation
+    # If Node helper failed, optionally fall back to the Python `praytimes` package
+    # only when it's actually installed. Otherwise return a 502 indicating the
+    # Node helper failed and no Python fallback is available.
+    if not PRAYTIMES_AVAILABLE:
+        return jsonify({'error': 'Node helper failed and Python prayertimes not available'}), 502
     try:
         tz = get_prayer_tz()
         try:
@@ -831,11 +843,29 @@ def api_force_schedule_today():
     if not SCHEDULER_AVAILABLE:
         return jsonify({'available': False, 'jobs_added': 0, 'message': 'Scheduler not available'})
     try:
+        # Allow optional JSON body {"date": "YYYY-MM-DD"} to force scheduling for
+        # a specific date (restricted to today or tomorrow via compute endpoint rules).
+        data = request.get_json(silent=True) or {}
+        date_str = data.get('date')
         tz = get_prayer_tz()
         try:
-            tgt = datetime.now(tz).date() if tz is not None else date.today()
+            today = datetime.now(tz).date() if tz is not None else date.today()
         except Exception:
-            tgt = date.today()
+            today = date.today()
+        if date_str:
+            try:
+                tgt = datetime.fromisoformat(date_str).date()
+            except Exception:
+                return jsonify({'available': False, 'jobs_added': 0, 'message': 'invalid date format, use YYYY-MM-DD'}), 400
+            # Restrict to today or tomorrow to avoid accidental wide-range scheduling
+            if tgt not in (today, today + timedelta(days=1)):
+                return jsonify({'available': False, 'jobs_added': 0, 'message': 'date must be today or tomorrow only'}), 400
+        else:
+            try:
+                tgt = datetime.now(tz).date() if tz is not None else date.today()
+            except Exception:
+                tgt = date.today()
+
         added = schedule_prayers_for_date(tgt)
         # Ensure daily rescheduler exists
         try:
@@ -989,9 +1019,9 @@ def api_test_schedule_past():
         except Exception:
             tz = None
         when = datetime.now(tz) - timedelta(seconds=secs)
-        # Force-add job in the past with zero misfire grace so it will not run late.
-            try:
-                scheduler.add_job('server:_http_post_play', trigger=DateTrigger(run_date=when), args=[fname], id=jid, misfire_grace_time=1)
+        # Force-add job in the past with minimal misfire grace so it will not run late.
+        try:
+            scheduler.add_job('server:_http_post_play', trigger=DateTrigger(run_date=when), args=[fname], id=jid, misfire_grace_time=1)
         except Exception as e:
             return jsonify({'status': 'error', 'message': f'Failed to add job: {e}'}), 500
 
@@ -1010,6 +1040,37 @@ def api_test_schedule_past():
             return jsonify({'status': 'error', 'message': f'Failed to inspect job: {e}'}), 500
     except Exception as e:
         logger.error(f"schedule-past error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/scheduler/admin/add-job', methods=['POST'])
+def api_scheduler_admin_add_job():
+    """Admin helper: add a DateTrigger job into the scheduler.
+
+    JSON: {"id": "job-id", "run_date": "ISO8601", "file": "azan.mp3"}
+    This is a lightweight helper used for testing and debugging only.
+    """
+    if not SCHEDULER_AVAILABLE or not scheduler:
+        return jsonify({'status': 'error', 'message': 'Scheduler not available'}), 400
+    try:
+        data = request.get_json(silent=True) or {}
+        jid = data.get('id')
+        run_date = data.get('run_date')
+        fname = (data.get('file') or 'azan.mp3').strip()
+        if not jid or not run_date:
+            return jsonify({'status': 'error', 'message': 'missing id or run_date'}), 400
+        try:
+            # Parse ISO8601 run_date; keep tzinfo if present
+            rd = datetime.fromisoformat(run_date)
+        except Exception:
+            return jsonify({'status': 'error', 'message': 'invalid run_date format'}), 400
+        try:
+            scheduler.add_job('server:_http_post_play', trigger=DateTrigger(run_date=rd), args=[fname], id=jid, misfire_grace_time=1)
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': f'failed to add job: {e}'}), 500
+        return jsonify({'status': 'ok', 'job_id': jid, 'run_date': rd.isoformat()})
+    except Exception as e:
+        logger.error(f"admin add-job error: {e}")
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
