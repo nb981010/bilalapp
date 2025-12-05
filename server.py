@@ -6,6 +6,7 @@ import logging
 import socket
 import json
 import subprocess
+import shutil
 from datetime import datetime, date, timedelta
 from flask import Flask, send_from_directory, jsonify, request
 from werkzeug.utils import secure_filename
@@ -161,25 +162,12 @@ def get_local_ip():
         return "127.0.0.1"
 
 def get_sonos_speakers():
-    """Discover and return Sonos speakers with fast timeout."""
-    logger.info("Starting Sonos speaker discovery")
-    try:
-        import soco
-    except ImportError:
-        logger.error("SoCo library not found.")
-        return []
-    # Use single attempt with 2-second timeout to avoid slow API responses
-    try:
-        logger.debug("Discovery attempt (2s timeout)")
-        zones = list(soco.discover(timeout=2) or [])
-        if zones:
-            logger.info(f"Discovered {len(zones)} Sonos speakers: {[z.player_name for z in zones]}")
-            return zones
-        else:
-            logger.warning("No Sonos speakers found")
-    except Exception as e:
-        logger.error(f"Error during Sonos discovery: {e}")
-    logger.info("No Sonos speakers discovered, returning empty list")
+    """Skip Sonos discovery and return empty list.
+
+    This deployment uses onboard audio only. Do not attempt network
+    discovery of Sonos/TOA devices — always prefer onboard playback.
+    """
+    logger.debug("Sonos discovery skipped: using onboard audio only")
     return []
 
 
@@ -210,6 +198,17 @@ def list_zones():
     logger.info("API /api/zones requested")
     try:
         speakers = get_sonos_speakers()
+        # If we have no Sonos speakers, present a single `Onboard` zone
+        if not speakers:
+            data = [{
+                "id": "onboard",
+                "name": "Onboard",
+                "isAvailable": True,
+                "status": "idle",
+                "volume": 100
+            }]
+            logger.info("API /api/zones returning onboard-only zone")
+            return jsonify(data)
         found_names = [s.player_name for s in speakers]
         data = []
         # Add discovered zones that match static names
@@ -419,6 +418,53 @@ def control_with_fallback(cloud_fn, local_fn):
         return local_fn(local_url)
     except Exception as e:
         logger.error(f"Local SoCo action failed: {e}")
+        raise
+
+
+def onboard_play(filename: str):
+    """Play audio using an onboard/local audio player.
+
+    Tries a set of known CLI players in order and launches the chosen
+    player in the background. Returns a dict on success or raises on
+    failure.
+    """
+    # Locate the audio file in the `audio/` folder
+    audio_path = os.path.join(os.path.dirname(__file__), 'audio', filename)
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
+    # Candidate players (priority order)
+    players = [
+        (['mpv', '--no-video', '--really-quiet', audio_path], 'mpv'),
+        (['ffplay', '-nodisp', '-autoexit', '-loglevel', 'quiet', audio_path], 'ffplay'),
+        (['mpg123', audio_path], 'mpg123'),
+        (['mpg321', audio_path], 'mpg321'),
+        (['vlc', '--intf', 'dummy', '--play-and-exit', audio_path], 'vlc'),
+        (['aplay', audio_path], 'aplay')
+    ]
+
+    chosen = None
+    for cmd, name in players:
+        if shutil.which(cmd[0]):
+            chosen = (cmd, name)
+            break
+
+    if chosen is None:
+        raise RuntimeError('No onboard audio player found (tried mpv, ffplay, mpg123, mpg321, vlc, aplay)')
+
+    cmd, name = chosen
+    logger.info(f"Starting onboard playback using {name}: {cmd}")
+    # Launch player detached so we return immediately
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # Record play history immediately (mark as attempted start)
+        try:
+            append_play_history_sql(filename, when=datetime.now(get_prayer_tz() or ZoneInfo('UTC')))
+        except Exception:
+            logger.warning("Failed to append play history after onboard start")
+        return {'status': 'ok', 'mode': 'onboard'}
+    except Exception as e:
+        logger.error(f"Failed to start onboard player {name}: {e}")
         raise
 
 
@@ -1365,9 +1411,12 @@ def prepare_group():
     logger.info("Preparing Zones for Azan...")
     
     try:
+        # Onboard-only mode: skip Sonos/TOA discovery and treat onboard
+        # audio as the playback target. No grouping required for onboard.
         speakers = get_sonos_speakers()
         if not speakers:
-            return jsonify({"status": "error", "message": "No speakers found"}), 404
+            logger.debug("Prepare called in onboard-only mode; skipping Sonos grouping")
+            return jsonify({"status": "success", "message": "Onboard audio selected; no grouping required", "coordinator": "onboard"})
 
         # 1. Snapshot current state (volume, URI, position) logic omitted for brevity in V1, 
         #    but we just group them now.
@@ -1419,177 +1468,18 @@ def play_audio():
         tz = None
 
     try:
-        # Prefer cloud control, fallback to local SoCo
-        def cloud_action(cloud_url):
-            # cloud microservice expects device_id and url; here we use coordinator discovery to find first cloud-device
-            # For simplicity, we call cloud discover and pick the first player id (if any) and then play
-            r = requests.get(f"{cloud_url}/cloud/discover", timeout=5)
-            if r.status_code != 200:
-                raise Exception('cloud discover failed')
-            data = r.json()
-            # data expected to be list of players
-            if not data:
-                raise Exception('no cloud devices')
-            device = data[0]
-            # Normalize device id selection from a variety of possible keys returned
-            device_id = None
-            if isinstance(device, dict):
-                for k in ('id', 'playerId', 'player_id', 'uid', 'playerID'):
-                    v = device.get(k)
-                    if v:
-                        device_id = v
-                        break
-            # If device is an object with attributes (unlikely), try attribute access
-            if not device_id:
-                try:
-                    device_id = getattr(device, 'id', None) or getattr(device, 'playerId', None) or getattr(device, 'uid', None)
-                except Exception:
-                    device_id = None
-            if not device_id:
-                raise Exception('no device id')
-            local_ip = get_local_ip()
-            audio_url = f"http://{local_ip}:5000/audio/{filename}"
-            pr = requests.post(f"{cloud_url}/cloud/play", json={'device_id': device_id, 'url': audio_url}, timeout=5)
-            if pr.status_code != 200:
-                raise Exception('cloud play failed')
-            return {'status': 'ok', 'mode': 'cloud'}
-
-        def local_action(local_url):
-            # Call local SoCo server to discover coordinator and play
-            r = requests.get(f"{local_url}/local/discover", timeout=5)
-            if r.status_code != 200:
-                raise Exception('local discover failed')
-            devices = r.json()
-            if not devices:
-                raise Exception('no local devices')
-            # pick first device name
-            name = devices[0].get('name')
-            local_ip = get_local_ip()
-            audio_url = f"http://{local_ip}:5000/audio/{filename}"
-            pr = requests.post(f"{local_url}/local/play", json={'device_name': name, 'url': audio_url}, timeout=5)
-            if pr.status_code not in (200, 204):
-                raise Exception('local play failed')
-            return {'status': 'ok', 'mode': 'local'}
-
-        result = control_with_fallback(cloud_action, local_action)
-        # If cloud/local handled playback, return success
-        if result and result.get('status') == 'ok':
-            return jsonify({'status': 'success', 'message': 'Playback Started', 'mode': result.get('mode')})
-        # otherwise continue into original local logic as a last resort
-
-        speakers = get_sonos_speakers()
-        if not speakers:
-            logger.error("No speakers found for Azan playback")
-            return jsonify({"status": "error", "message": "No speakers"}), 404
-
-        # Snapshot all zones: volume, uri, position
-        global SONOS_SNAPSHOT
-        SONOS_SNAPSHOT = {}
-        AZAN_LOCK = True
-        error_count = 0
-        logger.info("Starting snapshot of current Sonos state")
-        
-        # Find the coordinator
-        coordinator = next((s for s in speakers if s.is_coordinator), speakers[0])
-        logger.info(f"Coordinator: {coordinator.player_name}")
-        
-        # Get coordinator's track and transport info
-        track_info = coordinator.get_current_track_info()
-        transport_info = coordinator.get_current_transport_info()
-        logger.info(f"Coordinator track: uri={track_info.get('uri')}, position={track_info.get('position')}, state={transport_info.get('current_transport_state')}")
-        
-        for s in speakers:
-            try:
-                SONOS_SNAPSHOT[s.uid] = {
-                    "volume": s.volume,
-                    "uri": track_info.get("uri"),
-                    "position": track_info.get("position"),
-                    "state": transport_info.get("current_transport_state")
-                }
-                logger.info(f"Snapped {s.player_name}: vol={s.volume}, uri={track_info.get('uri')}, position={track_info.get('position')}")
-                # Set volume to 50%
-                s.volume = 50
-                logger.info(f"Set volume to 50% for {s.player_name}")
-            except Exception as e:
-                logger.warning(f"Snapshot failed for {s.player_name}: {e}")
-                error_count += 1
-        if error_count == len(speakers):
-            logger.error("Failed to snapshot any speakers")
-            AZAN_LOCK = False
-            return jsonify({"status": "error", "message": "Failed to snapshot all speakers."}), 500
-
-        # Use the elected coordinator determined earlier (do not overwrite)
-        local_ip = get_local_ip()
-        audio_url = f"http://{local_ip}:5000/audio/{filename}"
-        logger.info(f"Playing URL: {audio_url} on {coordinator.player_name}")
-
-        # Set metadata for display
-        title = "Azan by Bilal App"
-        meta = f"""<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">
-<item id="0" parentID="0" restricted="0">
-<dc:title>{title}</dc:title>
-<upnp:class>object.item.audioItem</upnp:class>
-<res protocolInfo="http-get:*:audio/mpeg:*">{audio_url}</res>
-</item>
-</DIDL-Lite>"""
-
+        # Use onboard audio playback directly (skip Sonos/TOA discovery and cloud/local calls)
         try:
-            coordinator.play_uri(audio_url, meta=meta)
-            # Give the speaker a short moment to accept the URI and update state
-            time.sleep(1)
-            # Verify the coordinator actually loaded/started the Azan URI
-            try:
-                post_track = coordinator.get_current_track_info()
-                post_transport = coordinator.get_current_transport_info()
-                post_uri = post_track.get('uri') or ''
-                post_state = post_transport.get('current_transport_state')
-                logger.info(f"Post-play check: uri={post_uri}, state={post_state}")
-                # Consider start successful only if the coordinator reports the Azan URI or is PLAYING
-                if (audio_url in post_uri) or (post_state == 'PLAYING'):
-                    AZAN_STARTED = True
-                    logger.info("Azan start confirmed on coordinator")
-                    # Record play history for scheduling decisions (mark when playback actually started)
-                    try:
-                        _append_play_history(filename, when=datetime.now(tz))
-                    except Exception:
-                        pass
-                    # Structured play-session start event
-                    try:
-                        event = {
-                            'event': 'start',
-                            'session_id': session_id,
-                            'file': filename,
-                            'coordinator': coordinator.player_name,
-                            'coordinator_uid': getattr(coordinator, 'uid', None),
-                            'speakers': [getattr(s, 'player_name', str(s)) for s in speakers],
-                            'start_ts': (datetime.now(tz).isoformat() if tz is not None else datetime.now().isoformat())
-                        }
-                        _write_play_session_event(event)
-                    except Exception as e:
-                        logger.warning(f"Failed to write session start event: {e}")
-                else:
-                    # Treat as failure: do not retry later
-                    logger.error("Coordinator did not start Azan (URI/state mismatch). Aborting single attempt.")
-                    AZAN_LOCK = False
-                    AZAN_STARTED = False
-                    return jsonify({"status": "error", "message": "Azan playback failed to start."}), 500
-            except Exception as e:
-                logger.error(f"Post-play verification failed: {e}")
-                AZAN_LOCK = False
-                AZAN_STARTED = False
-                return jsonify({"status": "error", "message": "Azan playback verification failed."}), 500
+            res = onboard_play(filename)
+            if res and res.get('status') == 'ok':
+                logger.info("Onboard playback started successfully")
+                return jsonify({'status': 'success', 'message': 'Playback Started', 'mode': 'onboard'})
+            else:
+                logger.error("Onboard playback returned unexpected result")
+                return jsonify({'status': 'error', 'message': 'Onboard playback failed'}), 500
         except Exception as e:
-            logger.error(f"Azan playback failed: {e}")
-            # Clear lock and do NOT retry — caller wanted single-attempt semantics
-            AZAN_LOCK = False
-            AZAN_STARTED = False
-            return jsonify({"status": "error", "message": "Azan playback failed."}), 500
-
-        # Start Monitoring Thread
-        PLAYBACK_ACTIVE = True
-        threading.Thread(target=monitor_playback, args=(coordinator, speakers, audio_url, session_id)).start()
-
-        return jsonify({"status": "success", "message": "Playback Started"})
+            logger.error(f"Onboard playback failed: {e}")
+            return jsonify({'status': 'error', 'message': f'Onboard playback failed: {e}'}), 500
 
     except Exception as e:
         logger.error(f"Play Error: {e}")
