@@ -6,7 +6,22 @@ from playback import get_local_ip, get_sonos_speakers, choose_coordinator, build
 import json
 from datetime import datetime, timezone, timedelta
 from flask import Flask, send_from_directory, jsonify, request
+from flask import abort
+import os
 
+# Local prayer calculation dependency (optional at runtime)
+try:
+    from praytimes import PrayTimes
+    PRAYTIMES_AVAILABLE = True
+except Exception:
+    PRAYTIMES_AVAILABLE = False
+
+# Optional tz detection for local timezone-aware scheduling
+try:
+    from tzlocal import get_localzone
+    TZLOCAL_AVAILABLE = True
+except Exception:
+    TZLOCAL_AVAILABLE = False
 # Scheduler imports (lazy import in case deps not installed)
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -36,6 +51,9 @@ SONOS_GROUPS = {}  # Store group snapshots
 SCHEDULER = None
 JOBSTORE_PATH = os.path.join(os.path.dirname(__file__), 'jobs.sqlite')
 
+# Default coordinates (Dubai) used when computing prayer times server-side
+DUBAI_COORDS = (25.2048, 55.2708)
+
 # played history marker (file-backed)
 PLAY_HISTORY_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'play_history.json')
 # persisted played markers to prevent duplicate plays within a day
@@ -44,6 +62,348 @@ PLAYED_MARKERS_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'played_ma
 # ---------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------
+
+def compute_prayer_times_for_date_module(d: datetime):
+    """Module-level prayer time computation returning prayer->UTC datetime mapping.
+
+    This mirrors the logic used inside init_scheduler but is importable so
+    APScheduler can persist jobs that reference a textual module:function.
+    """
+    # Mandatory Node/adahn calculation for module usage: do NOT fallback.
+    try:
+        import shutil, subprocess, json
+        node = shutil.which('node')
+        if not node:
+            logger.error('Node not found: cannot compute adhan times (module)')
+            return {}
+
+        tzname = None
+        if TZLOCAL_AVAILABLE:
+            try:
+                tzname = get_localzone().zone
+            except Exception:
+                tzname = None
+        if not tzname:
+            tzname = 'Asia/Dubai'
+
+        script = os.path.join(os.path.dirname(__file__), 'tools', 'compute_prayer_times.mjs')
+        lat, lon = DUBAI_COORDS
+        args = [node, script, d.strftime('%Y-%m-%d'), str(lat), str(lon), tzname]
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
+        if proc.returncode != 0 or not proc.stdout:
+            logger.error(f'Node adhan script failed (module): rc={proc.returncode} stderr={proc.stderr}')
+            return {}
+
+        js = json.loads(proc.stdout)
+        mapping = {}
+        for k in ('fajr', 'dhuhr', 'asr', 'maghrib', 'isha'):
+            v = js.get(k)
+            if v:
+                try:
+                    dt = datetime.fromisoformat(v.replace('Z', '+00:00'))
+                    mapping[k] = dt
+                except Exception:
+                    logger.exception('Failed parsing datetime from adhan output (module)')
+
+        return mapping
+    except Exception as e:
+        logger.exception(f'Adhan/node computation failed (module): {e}')
+        return {}
+
+
+def schedule_today_jobs_for_date(target_date: datetime):
+    """Module-level scheduler that creates persistent Azan jobs for `target_date`.
+
+    This function is importable (module:function string) and thus can be used
+    as the callable for persisted cron jobs in APScheduler.
+    """
+    global SCHEDULER
+    if not SCHEDULER:
+        logger.warning('Scheduler not available; cannot schedule jobs')
+        return
+
+    times = compute_prayer_times_for_date_module(target_date)
+    if not times:
+        logger.info('No prayer times computed for scheduling')
+        return
+
+    date_str = target_date.strftime('%Y-%m-%d')
+    for prayer, dt in times.items():
+        jid = f'azan-{date_str}-{prayer}'
+        try:
+            run_date = datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, tzinfo=timezone.utc)
+        except Exception:
+            run_date = None
+
+        if not run_date:
+            continue
+
+        if run_date <= datetime.utcnow().replace(tzinfo=timezone.utc):
+            logger.debug(f"Skipping scheduling past prayer {prayer} at {run_date}")
+            continue
+
+        if SCHEDULER.get_job(jid):
+            logger.debug(f"Job {jid} already exists; skipping")
+            continue
+
+        # Use a prayer-specific file for Fajr; otherwise use generic azan
+        file_name = 'fajr.mp3' if prayer and prayer.lower() == 'fajr' else 'azan.mp3'
+
+        try:
+            SCHEDULER.add_job('persistent_jobs:test_job_func', trigger='date', run_date=run_date, id=jid, kwargs={'job_id': jid, 'note': prayer, 'file': file_name, 'prayer': prayer})
+            logger.info(f"Scheduled Azan job {jid} -> {run_date}")
+        except Exception as e:
+            logger.error(f"Failed to schedule job {jid}: {e}")
+
+
+def schedule_today_jobs_wrapper():
+    """Wrapper for cron job: schedules today's azan jobs at invocation time."""
+    # The rescheduler runs at local 00:15 (with a timezone set on the cron job).
+    # Use the local date (tzlocal if available, otherwise Asia/Dubai) so we
+    # schedule jobs for the intended local day rather than the UTC day.
+    try:
+        local_tz = None
+        if TZLOCAL_AVAILABLE:
+            try:
+                from tzlocal import get_localzone
+                local_tz = get_localzone()
+            except Exception:
+                local_tz = None
+
+        if local_tz is None:
+            try:
+                # zoneinfo is available on modern Python; use Asia/Dubai as fallback
+                from zoneinfo import ZoneInfo
+                local_tz = ZoneInfo('Asia/Dubai')
+            except Exception:
+                local_tz = timezone.utc
+
+        local_now = datetime.now(local_tz)
+        # Pass the local datetime so the scheduler computes today's local date
+        schedule_today_jobs_for_date(local_now)
+    except Exception:
+        # Fallback to UTC date if anything goes wrong
+        schedule_today_jobs_for_date(datetime.utcnow())
+
+
+
+def init_scheduler():
+    """Initialize APScheduler with a persistent jobstore and rescheduler jobs.
+
+    This function is safe to call multiple times; it will only start the
+    scheduler once per process.
+    """
+    global SCHEDULER
+    if not APSCHEDULER_AVAILABLE:
+        logger.warning("APScheduler or SQLAlchemy not available; running without persistent scheduler.")
+        return
+
+    if SCHEDULER is not None:
+        logger.debug("Scheduler already initialized in this process; skipping init")
+        return
+
+    try:
+        jobstores = {
+            'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBSTORE_PATH}')
+        }
+        # Prefer local timezone when available so cron triggers and displayed
+        # next-run times align with local expectations (Asia/Dubai fallback).
+        try:
+            if TZLOCAL_AVAILABLE:
+                try:
+                    scheduler_tz = get_localzone()
+                except Exception:
+                    from zoneinfo import ZoneInfo
+                    scheduler_tz = ZoneInfo('Asia/Dubai')
+            else:
+                from zoneinfo import ZoneInfo
+                scheduler_tz = ZoneInfo('Asia/Dubai')
+        except Exception:
+            scheduler_tz = timezone.utc
+
+        SCHEDULER = BackgroundScheduler(jobstores=jobstores, timezone=scheduler_tz)
+        SCHEDULER.start()
+        logger.info(f"APScheduler started with jobstore: sqlite:///{JOBSTORE_PATH}")
+
+    except Exception as e:
+        logger.error(f"Failed to start APScheduler with SQLAlchemyJobStore: {e}")
+        SCHEDULER = None
+        return
+
+    # Helper: compute prayer times (local fallback) and schedule date jobs
+    def compute_prayer_times_for_date(d: datetime):
+        """Return a dict of prayer name -> UTC datetime for the given date.
+
+        Uses `praytimes` python library when available. Times are returned
+        as timezone-naive UTC datetimes.
+        """
+        # Mandatory Node/adahn calculation: do NOT fall back to python praytimes.
+        try:
+            import shutil, subprocess, json
+            node = shutil.which('node')
+            if not node:
+                logger.error('Node not found: cannot compute adhan times')
+                return {}
+
+            tzname = None
+            if TZLOCAL_AVAILABLE:
+                try:
+                    tzname = get_localzone().zone
+                except Exception:
+                    tzname = None
+            if not tzname:
+                tzname = 'Asia/Dubai'
+
+            script = os.path.join(os.path.dirname(__file__), 'tools', 'compute_prayer_times.mjs')
+            lat, lon = DUBAI_COORDS
+            args = [node, script, d.strftime('%Y-%m-%d'), str(lat), str(lon), tzname]
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=10)
+            if proc.returncode != 0 or not proc.stdout:
+                logger.error(f'Node adhan script failed: rc={proc.returncode} stderr={proc.stderr}')
+                return {}
+
+            js = json.loads(proc.stdout)
+            mapping = {}
+            for k in ('fajr', 'dhuhr', 'asr', 'maghrib', 'isha'):
+                v = js.get(k)
+                if v:
+                    try:
+                        dt = datetime.fromisoformat(v.replace('Z', '+00:00'))
+                        mapping[k] = dt
+                    except Exception:
+                        logger.exception('Failed parsing datetime from adhan output')
+
+            return mapping
+        except Exception as e:
+            logger.exception(f'Adhan/node computation failed: {e}')
+            return {}
+
+    def schedule_today_jobs(target_date: datetime):
+        """Schedule date-based Azan jobs for the given date (UTC datetimes).
+        Idempotent: will not create a job if job id already exists in the store.
+        """
+        if not SCHEDULER:
+            logger.warning('Scheduler not available; cannot schedule jobs')
+            return
+
+        # Compute times
+        times = compute_prayer_times_for_date(target_date)
+        if not times:
+            logger.info('No prayer times computed for scheduling')
+            return
+
+        date_str = target_date.strftime('%Y-%m-%d')
+        for prayer, dt in times.items():
+            # build job id with lowercase prayer name
+            jid = f'azan-{date_str}-{prayer}'
+            # Only add future jobs (dt is UTC naive representing UTC time)
+            try:
+                run_date = datetime(dt.year, dt.month, dt.day, dt.hour, dt.minute, tzinfo=timezone.utc)
+            except Exception:
+                run_date = None
+
+            if not run_date:
+                continue
+
+            # skip if run_date already in the past
+            if run_date <= datetime.utcnow().replace(tzinfo=timezone.utc):
+                logger.debug(f"Skipping scheduling past prayer {prayer} at {run_date}")
+                continue
+
+            if SCHEDULER.get_job(jid):
+                logger.debug(f"Job {jid} already exists; skipping")
+                continue
+
+            # add persistent one-shot job that will call persistent_jobs:test_job_func
+            # Use prayer-specific file for Fajr
+            try:
+                file_name = 'fajr.mp3' if prayer and prayer.lower() == 'fajr' else 'azan.mp3'
+                SCHEDULER.add_job('persistent_jobs:test_job_func', trigger='date', run_date=run_date, id=jid, kwargs={'job_id': jid, 'note': prayer, 'file': file_name, 'prayer': prayer})
+                logger.info(f"Scheduled Azan job {jid} -> {run_date}")
+            except Exception as e:
+                logger.error(f"Failed to schedule job {jid}: {e}")
+
+    # Add a daily rescheduler job at 00:15 UTC that will create jobs for the day
+    try:
+        if not SCHEDULER.get_job('rescheduler-daily'):
+            # Prefer to schedule daily at local 00:15 if tzlocal is available
+            try:
+                if TZLOCAL_AVAILABLE:
+                    tz = get_localzone()
+                else:
+                    tz = timezone.utc
+            except Exception:
+                tz = timezone.utc
+
+            # Use a textual module:function reference so the job can be persisted
+            # by SQLAlchemyJobStore. `schedule_today_jobs_wrapper` is defined at
+            # module level above.
+            try:
+                # Do NOT pass a per-job timezone here — rely on scheduler timezone
+                # so cron triggers are interpreted in the scheduler's zone.
+                SCHEDULER.add_job('server:schedule_today_jobs_wrapper', trigger='cron', hour=0, minute=15, id='rescheduler-daily')
+                logger.info(f"Scheduled daily rescheduler job at 00:15 (scheduler tz={getattr(SCHEDULER, 'timezone', 'unknown')}) (id=rescheduler-daily)")
+            except Exception as e:
+                logger.warning(f'Could not add rescheduler-daily job (persistable reference failed): {e}')
+        else:
+            logger.info('Daily rescheduler job already present')
+    except Exception as e:
+        logger.warning(f'Could not add rescheduler-daily job: {e}')
+
+    # If jobstore is empty (no azan jobs scheduled for today), run an immediate populate
+    try:
+        jobs = SCHEDULER.get_jobs()
+        has_azan = any(j.id.startswith('azan-') for j in jobs)
+        if not has_azan:
+            logger.info('Jobstore appears empty of azan jobs; scheduling today immediately')
+            # Use module-level scheduler helper to ensure consistent behavior
+            schedule_today_jobs_for_date(datetime.utcnow())
+    except Exception as e:
+        logger.warning(f'Error checking existing jobs: {e}')
+
+
+@app.route('/api/health/scheduler', methods=['GET'])
+def api_health_scheduler():
+    """Return scheduler health: whether scheduler is initialized, presence of rescheduler, and azan jobs."""
+    try:
+        info = {'scheduler_available': bool(SCHEDULER)}
+        if not SCHEDULER:
+            return jsonify(info)
+
+        res = SCHEDULER.get_job('rescheduler-daily')
+        info['rescheduler'] = {'exists': bool(res)}
+        # Present next_run_time in local timezone for easier human reading
+        try:
+            if TZLOCAL_AVAILABLE:
+                tz = get_localzone()
+            else:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo('Asia/Dubai')
+        except Exception:
+            tz = timezone.utc
+
+        if res and getattr(res, 'next_run_time', None):
+            try:
+                info['rescheduler']['next_run_time'] = res.next_run_time.astimezone(tz).isoformat()
+            except Exception:
+                info['rescheduler']['next_run_time'] = str(res.next_run_time)
+
+        azan_jobs = []
+        for j in SCHEDULER.get_jobs():
+            if j.id.startswith('azan-'):
+                nrt = None
+                if getattr(j, 'next_run_time', None):
+                    try:
+                        nrt = j.next_run_time.astimezone(tz).isoformat()
+                    except Exception:
+                        nrt = str(j.next_run_time)
+                azan_jobs.append({'id': j.id, 'next_run_time': nrt})
+
+        info['azan_jobs'] = azan_jobs
+        return jsonify(info)
+    except Exception as e:
+        logger.error(f"health endpoint error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 
 
@@ -142,13 +502,27 @@ def api_scheduler_jobs():
         if not SCHEDULER:
             return jsonify({"jobs": []})
 
+        # Determine local timezone for display
+        try:
+            if TZLOCAL_AVAILABLE:
+                tz = get_localzone()
+            else:
+                from zoneinfo import ZoneInfo
+                tz = ZoneInfo('Asia/Dubai')
+        except Exception:
+            tz = timezone.utc
+
         jobs = []
         for job in SCHEDULER.get_jobs():
             nrt = job.next_run_time
             nrt_str = None
             if nrt:
-                # Return in ISO-like format without timezone info to match existing UI handling
-                nrt_str = nrt.strftime('%Y-%m-%d %H:%M:%S')
+                try:
+                    local_nrt = nrt.astimezone(tz)
+                    # ISO with offset for clarity
+                    nrt_str = local_nrt.isoformat()
+                except Exception:
+                    nrt_str = nrt.strftime('%Y-%m-%d %H:%M:%S')
             jobs.append({
                 'id': job.id,
                 'next_run_time': nrt_str,
@@ -166,6 +540,16 @@ def api_scheduler_force_schedule():
     """Force a scheduling pass. This will not delete existing persisted jobs.
     Optional JSON body can include a `date` or `jobs` payload for testing."""
     try:
+        # Enforce that test/force operations require a testing token to avoid
+        # accidental modifications from an unauthorised UI. The environment
+        # variable `TESTING_TOKEN` should be set on test/dev deployments.
+        testing_token = os.environ.get('TESTING_TOKEN')
+        if testing_token:
+            header = request.headers.get('X-Testing-Token')
+            if header != testing_token:
+                logger.warning('Rejected force-schedule: missing/invalid testing token')
+                return jsonify({'status': 'error', 'message': 'testing token required'}), 403
+
         payload = request.get_json(silent=True) or {}
         logger.info(f"Force-schedule requested: {payload}")
 
@@ -221,6 +605,14 @@ def api_scheduler_simulate_play():
     Expected JSON: {"file":"azan.mp3","ts":"2025-11-27T18:31:00+04:00"}
     """
     try:
+        # Only allow simulate-play when a valid testing token is provided.
+        testing_token = os.environ.get('TESTING_TOKEN')
+        if testing_token:
+            header = request.headers.get('X-Testing-Token')
+            if header != testing_token:
+                logger.warning('Rejected simulate-play: missing/invalid testing token')
+                return jsonify({'status': 'error', 'message': 'testing token required'}), 403
+
         payload = request.get_json(force=True)
         if not payload or 'file' not in payload or 'ts' not in payload:
             return jsonify({"status": "error", "message": "file and ts required"}), 400
@@ -259,6 +651,13 @@ def api_scheduler_create_test_job():
     it by module path.
     """
     try:
+        # Only allow creating test jobs when a testing token is provided
+        testing_token = os.environ.get('TESTING_TOKEN')
+        if testing_token:
+            header = request.headers.get('X-Testing-Token')
+            if header != testing_token:
+                logger.warning('Rejected create_test_job: missing/invalid testing token')
+                return jsonify({'status': 'error', 'message': 'testing token required'}), 403
         if not SCHEDULER:
             return jsonify({"status": "error", "message": "Scheduler not available"}), 500
 
@@ -325,6 +724,48 @@ def api_scheduler_played():
         logger.error(f"played endpoint error: {e}")
         return jsonify({"markers": []}), 500
 
+
+@app.route('/api/scheduler/repopulate_today', methods=['POST'])
+def api_scheduler_repopulate_today():
+    """Admin endpoint: remove today's azan jobs and re-schedule using server calculation.
+
+    This will delete any persisted `azan-YYYY-MM-DD-*` jobs for today's local date
+    and create new ones using the adhan-based calculation (or fallback).
+    """
+    try:
+        if not SCHEDULER:
+            return jsonify({"status": "error", "message": "Scheduler not available"}), 500
+
+        # Determine local date for 'today'
+        if TZLOCAL_AVAILABLE:
+            try:
+                tz = get_localzone()
+                today = datetime.now(tz).date()
+            except Exception:
+                today = datetime.utcnow().date()
+        else:
+            today = datetime.utcnow().date()
+
+        date_str = today.isoformat()
+
+        # Remove existing azan jobs for today
+        removed = []
+        for job in SCHEDULER.get_jobs():
+            if job.id.startswith(f'azan-{date_str}-'):
+                try:
+                    SCHEDULER.remove_job(job.id)
+                    removed.append(job.id)
+                except Exception as e:
+                    logger.warning(f"Failed to remove job {job.id}: {e}")
+
+        # Recreate jobs for today using module-level helper
+        schedule_today_jobs_for_date(datetime.combine(today, datetime.min.time()))
+
+        return jsonify({"status": "ok", "removed": removed})
+    except Exception as e:
+        logger.error(f"repopulate_today error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 @app.route('/api/prepare', methods=['GET'])
 def prepare_group():
     """
@@ -353,6 +794,12 @@ def prepare_group():
                 except Exception:
                     pass
             coordinator_name = getattr(speakers[0], 'player_name', None)
+
+        # Allow the Sonos grouping to settle for a short moment before returning
+        try:
+            time.sleep(1.5)
+        except Exception:
+            pass
 
         return jsonify({"status": "success", "message": "Zones Grouped", "coordinator": coordinator_name})
 
@@ -396,6 +843,7 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
             logger.info(f"Skipping play_from_job for {prayer}: already played today")
             return {"status": "skipped", "message": "prayer already played today"}
 
+
         speakers = get_sonos_speakers()
         if not speakers:
             return {"status": "error", "message": "No speakers"}
@@ -404,15 +852,96 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
         if not coordinator:
             return {"status": "error", "message": "No coordinator"}
 
-        # Construct URL using playback helper
+        # Attempt to play; if the coordinator isn't properly the group coordinator
+        # Sonos may reject `play_uri`. Retry once after re-resolving the coordinator.
         audio_url = build_audio_url(filename)
-        logger.info(f"Playing URL (in-process): {audio_url} on {coordinator.player_name}")
+        logger.info(f"Playing URL (in-process): {audio_url} on {getattr(coordinator, 'player_name', None)}")
 
-        # Set Volume (Optional)
-        set_group_volume(coordinator, 45)
+        played_success = False
+        last_exc = None
 
-        # Play via helper
-        play_uri(coordinator, audio_url)
+        # Initial attempts: try twice, re-resolving coordinator between attempts
+        for attempt in (1, 2):
+            try:
+                set_group_volume(coordinator, 45)
+                play_uri(coordinator, audio_url)
+                played_success = True
+                break
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"play_uri attempt {attempt} failed: {e}")
+                if attempt == 1:
+                    try:
+                        time.sleep(1.0)
+                    except Exception:
+                        pass
+                    speakers = get_sonos_speakers()
+                    coordinator = choose_coordinator(speakers) or coordinator
+                    logger.info(f"Re-resolved coordinator to: {getattr(coordinator, 'player_name', None)}")
+                    continue
+
+        # If initial retries failed, attempt robust recovery: unjoin & rejoin members then play
+        if not played_success:
+            try:
+                logger.info("Attempting unjoin/rejoin recovery for Sonos group")
+                speakers = get_sonos_speakers()
+                if speakers:
+                    coordinator = choose_coordinator(speakers) or coordinator
+
+                    # Try to unjoin members from the coordinator first
+                    try:
+                        members = list(getattr(coordinator, 'group').members)
+                    except Exception:
+                        members = []
+
+                    for m in members:
+                        if m == coordinator:
+                            continue
+                        try:
+                            m.unjoin()
+                        except Exception:
+                            pass
+
+                    # Small pause to let unjoin take effect
+                    try:
+                        time.sleep(1.0)
+                    except Exception:
+                        pass
+
+                    # Re-join members to the coordinator
+                    for s in speakers:
+                        try:
+                            if s == coordinator:
+                                continue
+                            s.join(coordinator)
+                        except Exception:
+                            pass
+
+                    # Allow group to stabilize
+                    try:
+                        time.sleep(1.5)
+                    except Exception:
+                        pass
+
+                    # Final attempt to play
+                    try:
+                        set_group_volume(coordinator, 45)
+                        play_uri(coordinator, audio_url)
+                        played_success = True
+                        logger.info("Playback started after recovery")
+                    except Exception as e:
+                        last_exc = e
+                        logger.error(f"Playback failed after recovery: {e}")
+                else:
+                    logger.error("No speakers found during recovery attempt")
+            except Exception as e:
+                last_exc = e
+                logger.error(f"Recovery attempt error: {e}")
+
+        if not played_success:
+            # All attempts failed
+            msg = str(last_exc) if last_exc else 'unknown error'
+            return {"status": "error", "message": msg}
 
         # mark played for dedupe tracking if `prayer` provided
         try:
@@ -458,20 +987,13 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
 
 
 if __name__ == '__main__':
-    # Initialize scheduler with persistent SQLAlchemy jobstore (if available)
-    if APSCHEDULER_AVAILABLE:
-        try:
-            jobstores = {
-                'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBSTORE_PATH}')
-            }
-            SCHEDULER = BackgroundScheduler(jobstores=jobstores, timezone='UTC')
-            SCHEDULER.start()
-            logger.info(f"APScheduler started with jobstore: sqlite:///{JOBSTORE_PATH}")
-        except Exception as e:
-            logger.error(f"Failed to start APScheduler with SQLAlchemyJobStore: {e}")
-            SCHEDULER = None
-    else:
-        logger.warning("APScheduler or SQLAlchemy not available; running without persistent scheduler.")
-
+    # When running as script, ensure scheduler initialized and run Flask dev server
+    init_scheduler()
     logger.info("Server Starting on Port 5000...")
     app.run(host='0.0.0.0', port=5000)
+
+# Ensure scheduler initialized when module is imported (useful for gunicorn --preload)
+try:
+    init_scheduler()
+except Exception as e:
+    logger.exception(f"init_scheduler() on import failed: {e}")

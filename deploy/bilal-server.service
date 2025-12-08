@@ -1,0 +1,18 @@
+[Unit]
+Description=Bilal Azan Server
+After=network.target
+
+[Service]
+Type=simple
+User=nbc
+WorkingDirectory=/home/nbc/bilalapp
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/nbc/bilalapp/.venv/bin/python /home/nbc/bilalapp/server.py
+Environment=TESTING_TOKEN=ryhaYpDKnmffQ2NXXdPMOeerEiV7CybV
+Restart=always
+RestartSec=5
+StandardOutput=file:/home/nbc/bilalapp/logs/server_stdout.log
+StandardError=file:/home/nbc/bilalapp/logs/sys.log
+
+[Install]
+WantedBy=multi-user.target

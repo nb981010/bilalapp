@@ -70,8 +70,11 @@ After=network.target
 [Service]
 User=$REAL_USER
 WorkingDirectory=$APP_DIR
-ExecStart=/usr/bin/python3 $APP_DIR/server.py
-Restart=always
+ExecStart=$APP_DIR/venv/bin/gunicorn --preload --chdir $APP_DIR -w ${GUNICORN_WORKERS:-2} -b 127.0.0.1:5000 server:app
+Restart=on-failure
+# Prevent tight restart loops: allow 5 restarts per 10 minutes
+StartLimitBurst=5
+StartLimitIntervalSec=600
 # Wait a bit before restarting to prevent tight loops if failing
 RestartSec=10
 StandardOutput=append:$LOG_DIR/sys.log
