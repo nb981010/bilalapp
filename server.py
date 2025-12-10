@@ -3,7 +3,7 @@ import time
 import threading
 import logging
 import socket
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -35,6 +35,11 @@ app = Flask(__name__, static_folder='.')
 SONOS_GROUPS = {}  # Store group snapshots
 PLAYBACK_ACTIVE = False
 
+# played history marker (file-backed)
+PLAY_HISTORY_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'play_history.json')
+# persisted played markers to prevent duplicate plays within a day
+PLAYED_MARKERS_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'played_markers.json')
+
 # Scheduler (initialized later if available)
 SCHEDULER = None
 JOBSTORE_DB = os.path.join(os.path.dirname(__file__), 'apscheduler_jobs.sqlite')
@@ -63,10 +68,18 @@ def init_scheduler():
         logger.info(f'APScheduler started with jobstore: {JOBSTORE_DB}')
         # Ensure daily reschedule job exists
         try:
-            if not SCHEDULER.get_job('azan_job_daily_reschedule'):
-                # run daily at 00:05 local time to recompute next day's jobs
-                SCHEDULER.add_job(schedule_daily_reschedule, 'cron', hour=0, minute=5, id='azan_job_daily_reschedule', name='schedule_daily_reschedule')
-                logger.info('Added daily reschedule job azan_job_daily_reschedule')
+            # Always ensure the cron exists and is set to 00:15. If an older job
+            # exists (e.g., persisted with minute=5), remove and recreate it.
+            existing = SCHEDULER.get_job('azan_job_daily_reschedule')
+            if existing:
+                try:
+                    SCHEDULER.remove_job('azan_job_daily_reschedule')
+                    logger.info('Removed existing daily reschedule job to update schedule')
+                except Exception:
+                    logger.exception('Failed to remove existing azan_job_daily_reschedule')
+            # run daily at 00:15 local time to recompute next day's jobs
+            SCHEDULER.add_job(schedule_daily_reschedule, 'cron', hour=0, minute=15, id='azan_job_daily_reschedule', name='schedule_daily_reschedule')
+            logger.info('Added daily reschedule job azan_job_daily_reschedule')
         except Exception:
             logger.exception('Failed to ensure daily reschedule job')
     except Exception as e:
@@ -157,13 +170,73 @@ def schedule_daily_reschedule():
 
         # ensure daily reschedule cron is present (in case jobstore was replaced)
         try:
-            if not SCHEDULER.get_job('azan_job_daily_reschedule'):
-                SCHEDULER.add_job(schedule_daily_reschedule, 'cron', hour=0, minute=5, id='azan_job_daily_reschedule', name='schedule_daily_reschedule')
+            # Ensure cron exists and update if necessary
+            existing = SCHEDULER.get_job('azan_job_daily_reschedule')
+            if not existing:
+                SCHEDULER.add_job(schedule_daily_reschedule, 'cron', hour=0, minute=15, id='azan_job_daily_reschedule', name='schedule_daily_reschedule')
+            else:
+                # If the job exists but we want to enforce minute=15, replace it.
+                try:
+                    SCHEDULER.remove_job('azan_job_daily_reschedule')
+                    SCHEDULER.add_job(schedule_daily_reschedule, 'cron', hour=0, minute=15, id='azan_job_daily_reschedule', name='schedule_daily_reschedule')
+                except Exception:
+                    pass
         except Exception:
             pass
 
     except Exception as e:
         logger.exception('schedule_daily_reschedule failed: %s', e)
+
+
+# -------------------- played-markers helpers --------------------
+def _load_played_markers():
+    try:
+        if os.path.exists(PLAYED_MARKERS_FILE):
+            with open(PLAYED_MARKERS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return []
+
+
+def _save_played_markers(markers):
+    try:
+        with open(PLAYED_MARKERS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(markers, f)
+    except Exception as e:
+        logger.warning(f"Could not save played markers: {e}")
+
+
+def has_played_today(prayer: str) -> bool:
+    """Return True if `prayer` has been recorded as played for today's date."""
+    if not prayer:
+        return False
+    today = datetime.utcnow().date().isoformat()
+    markers = _load_played_markers()
+    for m in markers:
+        if m.get('date') == today and m.get('prayer') == prayer:
+            return True
+    return False
+
+
+def mark_played(prayer: str, details: dict = None):
+    """Record that `prayer` was played today. `details` may include extra metadata."""
+    if not prayer:
+        return
+    today = datetime.utcnow().date().isoformat()
+    markers = _load_played_markers()
+    entry = {'date': today, 'prayer': prayer, 'ts': datetime.utcnow().isoformat() + 'Z'}
+    if details and isinstance(details, dict):
+        entry.update(details)
+    markers.append(entry)
+    # Keep markers trimmed to last 30 days to avoid unbounded growth
+    try:
+        cutoff = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
+        markers = [m for m in markers if m.get('date', '') >= cutoff]
+    except Exception:
+        pass
+    _save_played_markers(markers)
+
 
 # ---------------------------------------------------------
 # Helpers
@@ -341,32 +414,193 @@ def monitor_playback(coordinator):
 
 @app.route('/api/scheduler/jobs', methods=['GET'])
 def api_scheduler_jobs():
-    """Return a JSON list of scheduled jobs."""
+    """Return scheduled jobs (id + next_run_time).
+
+    Returns an object with `jobs` array to match front-end expectations.
+    """
     if SCHEDULER is None:
         # Try to initialize if possible
         init_scheduler()
     try:
-        jobs = []
         if SCHEDULER is None:
-            return jsonify([])
-        for j in SCHEDULER.get_jobs():
-            nrt = None
-            if j.next_run_time:
+            return jsonify({"jobs": []})
+
+        jobs = []
+        for job in SCHEDULER.get_jobs():
+            nrt = job.next_run_time
+            nrt_str = None
+            if nrt:
                 try:
-                    nrt = j.next_run_time.isoformat()
+                    # Return in ISO-like format without timezone info to match existing UI handling
+                    nrt_str = nrt.strftime('%Y-%m-%d %H:%M:%S')
                 except Exception:
-                    nrt = str(j.next_run_time)
+                    nrt_str = str(nrt)
+
             jobs.append({
-                'id': j.id,
-                'name': j.name,
-                'next_run_time': nrt,
-                'trigger': type(j.trigger).__name__,
-                'func_ref': f"{j.func.__module__}:{j.func.__name__}" if hasattr(j, 'func') else None
+                'id': job.id,
+                'next_run_time': nrt_str,
+                'trigger': str(job.trigger)
             })
-        return jsonify(jobs)
+
+        return jsonify({"jobs": jobs})
     except Exception as e:
         logger.exception('api_scheduler_jobs error: %s', e)
-        return jsonify([]), 500
+        return jsonify({"jobs": []}), 500
+
+
+@app.route('/api/scheduler/simulate-play', methods=['POST'])
+def api_scheduler_simulate_play():
+    """Append a simulated play_history entry for testing scheduling logic.
+    Expected JSON: {"file":"azan.mp3","ts":"2025-11-27T18:31:00+04:00"}
+    """
+    try:
+        payload = request.get_json(force=True)
+        if not payload or 'file' not in payload or 'ts' not in payload:
+            return jsonify({"status": "error", "message": "file and ts required"}), 400
+
+        # Append to play_history.json
+        try:
+            if os.path.exists(PLAY_HISTORY_FILE):
+                with open(PLAY_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    hist = json.load(f)
+            else:
+                hist = []
+        except Exception:
+            hist = []
+
+        hist.append({"file": payload['file'], "ts": payload['ts']})
+        with open(PLAY_HISTORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(hist, f)
+
+        logger.info(f"Simulated play appended: {payload}")
+        return jsonify({"status": "success"})
+    except Exception as e:
+        logger.exception(f"simulate-play error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/scheduler/create_test_job', methods=['POST'])
+def api_scheduler_create_test_job():
+    """Create a persistent test job in the scheduler.
+
+    JSON body (optional): {
+        "id": "test-job-2025-11-29",
+        "run_date": "2025-11-29T12:34:00Z",
+        "note": "optional note"
+    }
+    The scheduled callable is `server.test_job_func` so the jobstore can persist
+    it by module path.
+    """
+    if SCHEDULER is None:
+        init_scheduler()
+    try:
+        if not SCHEDULER:
+            return jsonify({"status": "error", "message": "Scheduler not available"}), 500
+
+        payload = request.get_json(silent=True) or {}
+        job_id = payload.get('id')
+        note = payload.get('note')
+
+        if not job_id:
+            today = datetime.utcnow().strftime('%Y%m%d')
+            job_id = f"test-job-{today}"
+
+        rd = payload.get('run_date')
+        if rd:
+            try:
+                run_date = datetime.fromisoformat(rd.replace('Z', '+00:00'))
+            except Exception:
+                return jsonify({"status": "error", "message": "invalid run_date format"}), 400
+        else:
+            run_date = datetime.utcnow() + timedelta(minutes=5)
+
+        existing = SCHEDULER.get_job(job_id)
+        if existing:
+            return jsonify({"status": "exists", "id": job_id, "next_run_time": existing.next_run_time.isoformat() if existing.next_run_time else None})
+
+        # Add job using module:function string so SQLAlchemyJobStore can persist
+        try:
+            SCHEDULER.add_job('persistent_jobs:test_job_func', trigger='date', run_date=run_date, id=job_id, kwargs={'job_id': job_id, 'note': note})
+        except Exception:
+            # fallback to server path
+            SCHEDULER.add_job('server:test_job_func', trigger='date', run_date=run_date, id=job_id, kwargs={'job_id': job_id, 'note': note})
+
+        logger.info(f"Created test job {job_id} run_date={run_date}")
+        return jsonify({"status": "created", "id": job_id, "next_run_time": run_date.isoformat()})
+
+    except Exception as e:
+        logger.exception(f"create_test_job error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/api/scheduler/played', methods=['GET'])
+def api_scheduler_played():
+    """Return played markers for today (and optional query `days` to include prior days).
+    Example: `/api/scheduler/played?days=3` returns last 3 days of markers.
+    """
+    try:
+        days_q = request.args.get('days', '1')
+        try:
+            days = int(days_q)
+        except Exception:
+            days = 1
+
+        markers = _load_played_markers()
+        if days <= 1:
+            today = datetime.utcnow().date().isoformat()
+            todays = [m for m in markers if m.get('date') == today]
+            return jsonify({"markers": todays})
+
+        cutoff = (datetime.utcnow() - timedelta(days=days-1)).date().isoformat()
+        results = [m for m in markers if m.get('date', '') >= cutoff]
+        return jsonify({"markers": results})
+    except Exception as e:
+        logger.exception(f"played endpoint error: {e}")
+        return jsonify({"markers": []}), 500
+
+
+def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dict:
+    """Internal in-process playback function used by scheduled jobs and `/api/play`.
+
+    Returns a dict with `status` and optional `message`. This mirrors the behavior
+    of the `/api/play` route but runs in-process (no HTTP).
+    """
+    global PLAYBACK_ACTIVE
+    try:
+        logger.info(f"play_from_job invoked: file={filename} prayer={prayer} force={force}")
+
+        if prayer and not force and has_played_today(prayer):
+            logger.info(f"Skipping play_from_job for {prayer}: already played today")
+            return {"status": "skipped", "message": "prayer already played today"}
+
+        speakers = get_sonos_speakers()
+        if not speakers:
+            return {"status": "error", "message": "No speakers"}
+
+        coordinator = speakers[0]
+        # Construct URL using local helper
+        audio_url = f"http://{get_local_ip()}:5000/audio/{filename}"
+        logger.info(f"Playing URL (in-process): {audio_url} on {coordinator.player_name}")
+
+        try:
+            coordinator.group.volume = 45
+        except Exception:
+            pass
+
+        start_playback(audio_url, coordinator)
+
+        try:
+            if prayer:
+                mark_played(prayer, {"file": filename})
+        except Exception as e:
+            logger.warning(f"Failed to mark played: {e}")
+
+        return {"status": "success"}
+
+    except Exception as e:
+        logger.exception(f"play_from_job error: {e}")
+        return {"status": "error", "message": str(e)}
+
 
 
 @app.route('/api/scheduler', methods=['GET'])
@@ -387,6 +621,145 @@ def api_scheduler_reschedule():
     except Exception as e:
         logger.exception('api_scheduler_reschedule error: %s', e)
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/scheduler/force_schedule', methods=['POST'])
+def api_scheduler_force_schedule():
+    """Force schedule prepare/play jobs for a specific date (default: today).
+
+    This will add date-trigger jobs even if the scheduled times are in the past.
+    Request JSON: { "date": "YYYY-MM-DD" }
+    """
+    if SCHEDULER is None:
+        init_scheduler()
+    try:
+        payload = request.get_json() or {}
+        date_str = payload.get('date') or datetime.now().date().isoformat()
+
+        lat = float(os.environ.get('PRAYER_LAT', '25.2048'))
+        lon = float(os.environ.get('PRAYER_LON', '55.2708'))
+
+        # Call Node adhan script
+        cmd = ['node', os.path.join(os.path.dirname(__file__), 'scripts', 'compute_prayer_times.mjs'), date_str, str(lat), str(lon), os.environ.get('PRAYER_METHOD', 'Dubai')]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=10)
+        parsed = json.loads(out)
+        times = parsed
+
+        prayer_order = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
+        scheduled = []
+        from datetime import timedelta
+        # compute tz-aware datetimes for the date
+        local_tz = __import__('tzlocal').get_localzone()
+        y, m, d = [int(x) for x in date_str.split('-')]
+        for p in prayer_order:
+            t_str = times.get(p)
+            if not t_str:
+                continue
+            hh, mm = [int(x) for x in t_str.split(':')[:2]]
+            try:
+                if hasattr(local_tz, 'localize'):
+                    run_dt = local_tz.localize(datetime(y, m, d, hh, mm, 0))
+                else:
+                    run_dt = datetime(y, m, d, hh, mm, 0, tzinfo=local_tz)
+            except Exception:
+                continue
+
+            prepare_dt = run_dt - timedelta(minutes=1)
+            prepare_id = f'azan_job_{date_str}_{p}_prepare'
+            play_id = f'azan_job_{date_str}_{p}_play'
+
+            # Remove existing if present
+            try:
+                if SCHEDULER.get_job(prepare_id):
+                    SCHEDULER.remove_job(prepare_id)
+            except Exception:
+                pass
+            try:
+                if SCHEDULER.get_job(play_id):
+                    SCHEDULER.remove_job(play_id)
+            except Exception:
+                pass
+
+            # Force-add jobs regardless of current time
+            SCHEDULER.add_job(_run_prepare_job, 'date', run_date=prepare_dt, id=prepare_id, name='_run_prepare_job', args=[p])
+            SCHEDULER.add_job(_run_play_job, 'date', run_date=run_dt, id=play_id, name='_run_play_job', args=[p, 'azan.mp3'])
+            scheduled.append({'prayer': p, 'prepare_at': prepare_dt.isoformat(), 'play_at': run_dt.isoformat()})
+
+        return jsonify({'status': 'ok', 'scheduled': scheduled})
+    except subprocess.CalledProcessError as e:
+        logger.exception('Force schedule failed: %s', e)
+        return jsonify({'status': 'error', 'message': 'Node compute failed', 'detail': str(e.output)}), 500
+    except Exception as e:
+        logger.exception('api_scheduler_force_schedule error: %s', e)
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@app.route('/api/scheduler/force-schedule', methods=['POST'])
+def api_scheduler_force_schedule_payload():
+    """Force-schedule by accepting explicit job payloads (compatible with azan-01).
+
+    Expected JSON: { "jobs": [ {"id":"...","run_date":"ISO","prayer":"fajr","file":"azan.mp3"}, ... ] }
+    """
+    if SCHEDULER is None:
+        init_scheduler()
+    try:
+        payload = request.get_json(silent=True) or {}
+        jobs = payload.get('jobs') or []
+        created = []
+        errors = []
+        for j in jobs:
+            try:
+                jid = j.get('id')
+                rd = j.get('run_date')
+                prayer = j.get('prayer')
+                file = j.get('file', 'azan.mp3')
+
+                if not jid or not rd:
+                    errors.append({"job": j, "error": "id and run_date required"})
+                    continue
+
+                try:
+                    run_date = datetime.fromisoformat(rd.replace('Z', '+00:00'))
+                except Exception:
+                    errors.append({"job": j, "error": "invalid run_date"})
+                    continue
+
+                if not SCHEDULER:
+                    errors.append({"job": j, "error": "scheduler not available"})
+                    continue
+
+                if SCHEDULER.get_job(jid):
+                    logger.info(f"Job {jid} already exists; skipping")
+                    continue
+
+                # Try to add a persistable job by module:function name so SQLAlchemyJobStore can persist
+                # Prefer `persistent_jobs:test_job_func` so the jobstore can import the callable
+                added = False
+                try:
+                    SCHEDULER.add_job('persistent_jobs:test_job_func', trigger='date', run_date=run_date, id=jid, kwargs={'job_id': jid, 'note': prayer, 'file': file, 'prayer': prayer})
+                    added = True
+                except Exception:
+                    try:
+                        # Fallback to server module path
+                        SCHEDULER.add_job('server:test_job_func', trigger='date', run_date=run_date, id=jid, kwargs={'job_id': jid, 'note': prayer, 'file': file, 'prayer': prayer})
+                        added = True
+                    except Exception:
+                        pass
+
+                if not added:
+                    # Final fallback to direct function reference (non-persistable)
+                    SCHEDULER.add_job(test_job_func, trigger='date', run_date=run_date, id=jid, kwargs={'job_id': jid, 'note': prayer, 'file': file, 'prayer': prayer})
+
+                created.append(jid)
+                logger.info(f"Force-scheduled job {jid} -> {run_date}")
+            except Exception as e:
+                logger.exception(f"Error scheduling job {j}: {e}")
+                errors.append({"job": j, "error": str(e)})
+
+        return jsonify({"status": "ok", "created": created, "errors": errors})
+    except Exception as e:
+        logger.exception(f"force-schedule error: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 
 def start_playback(audio_url, coordinator):
@@ -427,16 +800,39 @@ def _run_play_job(prayer=None, file='azan.mp3'):
     """APScheduler callable used by persisted jobs to start playback."""
     logger.info(f"Scheduler running play job for {prayer}, file={file}")
     try:
-        speakers = get_sonos_speakers()
-        if not speakers:
-            logger.warning('No speakers found for scheduled play')
-            return
-        coordinator = speakers[0]
-        local_ip = get_local_ip()
-        audio_url = f"http://{local_ip}:5000/audio/{file}"
-        start_playback(audio_url, coordinator)
+        # Use the in-process playback helper so we respect played markers and
+        # centralized behavior.
+        result = play_from_job(file, prayer=prayer, force=False)
+        if result.get('status') != 'success':
+            logger.warning(f"Scheduled play did not start: {result}")
     except Exception as e:
         logger.exception('Play job failed: %s', e)
+
+
+def test_job_func(job_id=None, note=None, **kwargs):
+    """A simple importable function that can be scheduled and persisted.
+    It logs invocation and appends a record to the play history for visibility.
+    """
+    logger.info(f"Test job executed: {job_id} note={note}")
+    try:
+        entry = {"file": "test-job", "ts": datetime.utcnow().isoformat() + 'Z', "job_id": job_id, "note": note}
+        if os.path.exists(PLAY_HISTORY_FILE):
+            try:
+                with open(PLAY_HISTORY_FILE, 'r', encoding='utf-8') as f:
+                    hist = json.load(f)
+            except Exception:
+                hist = []
+        else:
+            hist = []
+
+        hist.append(entry)
+        try:
+            with open(PLAY_HISTORY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(hist, f)
+        except Exception as e:
+            logger.warning(f"Could not write play history from test job: {e}")
+    except Exception:
+        pass
 
 if __name__ == '__main__':
     logger.info("Server Starting on Port 5000...")
