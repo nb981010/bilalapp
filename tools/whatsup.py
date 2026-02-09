@@ -15,6 +15,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 import json
 import sys
+import argparse
 
 
 RE_LOG_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) - .* - (?:INFO|WARNING|ERROR) - (.*)$")
@@ -132,20 +133,15 @@ def format_duration(delta: timedelta | None) -> str:
 
 
 def main():
-    today = datetime.now().date()
-    date_str = today.isoformat()
-    db_path = os.path.join(os.path.dirname(__file__), '..', 'apscheduler_jobs.sqlite')
+    parser = argparse.ArgumentParser(description='Show Azan play status for past N days')
+    parser.add_argument('--days', type=int, default=2, help='Number of days to report (including today)')
+    args = parser.parse_args()
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    db_path = os.path.join(repo_root, 'apscheduler_jobs.sqlite')
     db_path = os.path.abspath(db_path)
 
-    # read persisted play jobs for today
-    try:
-        jobs = read_db_jobs(db_path, date_str)
-    except FileNotFoundError:
-        print(f"apscheduler DB not found at {db_path}")
-        sys.exit(1)
-
-    # read logs
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    # read logs once
     log_paths = [os.path.join(repo_root, 'logs', 'out.log'), os.path.join(repo_root, 'logs', 'sys.log')]
     lines = read_logs(log_paths)
 
@@ -153,31 +149,46 @@ def main():
 
     # Print header
     print("Date\tPrayer\tStart (log)\tEnd (log)\tDuration\tStatus")
-    for p in prayers:
-        scheduled_epoch = jobs.get(p)
-        scheduled_dt = None
-        if scheduled_epoch:
-            # convert epoch to local naive datetime using system timezone
-            try:
-                scheduled_dt = datetime.fromtimestamp(scheduled_epoch)
-            except Exception:
-                scheduled_dt = None
 
-        start, end = find_events_for_prayer(lines, p, scheduled_dt)
-        if start and end:
-            duration = end - start
-            status = 'Success'
-        elif start and not end:
-            duration = None
-            status = 'Started'
-        else:
-            duration = None
-            status = 'Missing'
+    today = datetime.now().date()
+    for delta_days in range(0, args.days):
+        target_date = today - timedelta(days=delta_days)
+        date_str = target_date.isoformat()
 
-        start_s = start.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if start else ''
-        end_s = end.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if end else ''
-        dur_s = format_duration(duration)
-        print(f"{date_str}\t{p.capitalize()}\t{start_s}\t{end_s}\t{dur_s}\t{status}")
+        # read persisted play jobs for the date
+        try:
+            jobs = read_db_jobs(db_path, date_str)
+        except FileNotFoundError:
+            # No DB available; fall back to log-only detection
+            jobs = {}
+            if delta_days == 0:
+                # only print notice once (for today)
+                print(f"apscheduler DB not found at {db_path}; falling back to logs")
+
+        for p in prayers:
+            scheduled_epoch = jobs.get(p)
+            scheduled_dt = None
+            if scheduled_epoch:
+                try:
+                    scheduled_dt = datetime.fromtimestamp(scheduled_epoch)
+                except Exception:
+                    scheduled_dt = None
+
+            start, end = find_events_for_prayer(lines, p, scheduled_dt)
+            if start and end:
+                duration = end - start
+                status = 'Success'
+            elif start and not end:
+                duration = None
+                status = 'Started'
+            else:
+                duration = None
+                status = 'Failure'
+
+            start_s = start.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if start else ''
+            end_s = end.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if end else ''
+            dur_s = format_duration(duration)
+            print(f"{date_str}\t{p.capitalize()}\t{start_s}\t{end_s}\t{dur_s}\t{status}")
 
 
 if __name__ == '__main__':
