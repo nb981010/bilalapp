@@ -138,8 +138,17 @@ def main():
     args = parser.parse_args()
 
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    db_path = os.path.join(repo_root, 'apscheduler_jobs.sqlite')
-    db_path = os.path.abspath(db_path)
+
+    # APScheduler jobstore is persisted to jobs.sqlite (not apscheduler_jobs.sqlite).
+    # Keep a compatibility fallback to apscheduler_jobs.sqlite if it exists.
+    default_db = os.path.join(repo_root, 'jobs.sqlite')
+    legacy_db = os.path.join(repo_root, 'apscheduler_jobs.sqlite')
+    if os.path.exists(default_db):
+        db_path = os.path.abspath(default_db)
+    elif os.path.exists(legacy_db):
+        db_path = os.path.abspath(legacy_db)
+    else:
+        db_path = os.path.abspath(default_db)
 
     # read logs once
     log_paths = [os.path.join(repo_root, 'logs', 'out.log'), os.path.join(repo_root, 'logs', 'sys.log')]

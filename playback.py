@@ -46,7 +46,7 @@ def build_audio_url(filename: str, port: int = 5000) -> str:
     return f"http://{ip}:{port}/audio/{filename}"
 
 
-def set_group_volume(coordinator, volume: int = 45):
+def set_group_volume(coordinator, volume: int = 65):
     try:
         coordinator.group.volume = volume
     except Exception:

@@ -848,6 +848,15 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
         if not speakers:
             return {"status": "error", "message": "No speakers"}
 
+        # Always group all zones before playback so azan hits every room.
+        try:
+            from playback import group_zones
+            group_zones(speakers)
+            # re-discover to pick the active coordinator after grouping
+            speakers = get_sonos_speakers()
+        except Exception:
+            pass
+
         coordinator = choose_coordinator(speakers)
         if not coordinator:
             return {"status": "error", "message": "No coordinator"}
@@ -863,7 +872,7 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
         # Initial attempts: try twice, re-resolving coordinator between attempts
         for attempt in (1, 2):
             try:
-                set_group_volume(coordinator, 45)
+                set_group_volume(coordinator, 90)
                 play_uri(coordinator, audio_url)
                 played_success = True
                 break
@@ -925,7 +934,7 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
 
                     # Final attempt to play
                     try:
-                        set_group_volume(coordinator, 45)
+                        set_group_volume(coordinator, 90)
                         play_uri(coordinator, audio_url)
                         played_success = True
                         logger.info("Playback started after recovery")
