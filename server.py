@@ -25,7 +25,7 @@ except Exception:
 # Scheduler imports (lazy import in case deps not installed)
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
-    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+    from apscheduler.jobstores.memory import MemoryJobStore
     APSCHEDULER_AVAILABLE = True
 except Exception:
     APSCHEDULER_AVAILABLE = False
@@ -49,7 +49,7 @@ app = Flask(__name__, static_folder='.')
 # Global State
 SONOS_GROUPS = {}  # Store group snapshots
 SCHEDULER = None
-JOBSTORE_PATH = os.path.join(os.path.dirname(__file__), 'jobs.sqlite')
+SCHEDULER_LAST_HEARTBEAT = None  # Track scheduler health
 
 # Default coordinates (Dubai) used when computing prayer times server-side
 DUBAI_COORDS = (25.2048, 55.2708)
@@ -158,6 +158,11 @@ def schedule_today_jobs_for_date(target_date: datetime):
 
 def schedule_today_jobs_wrapper():
     """Wrapper for cron job: schedules today's azan jobs at invocation time."""
+    global SCHEDULER_LAST_HEARTBEAT
+    
+    # Update heartbeat to indicate scheduler is alive
+    SCHEDULER_LAST_HEARTBEAT = datetime.now(timezone.utc)
+    
     # The rescheduler runs at local 00:15 (with a timezone set on the cron job).
     # Use the local date (tzlocal if available, otherwise Asia/Dubai) so we
     # schedule jobs for the intended local day rather than the UTC day.
@@ -181,30 +186,104 @@ def schedule_today_jobs_wrapper():
         local_now = datetime.now(local_tz)
         # Pass the local datetime so the scheduler computes today's local date
         schedule_today_jobs_for_date(local_now)
-    except Exception:
+        logger.info(f"Daily rescheduler executed successfully at {SCHEDULER_LAST_HEARTBEAT}")
+    except Exception as e:
+        logger.exception(f'Exception in schedule_today_jobs_wrapper: {e}')
         # Fallback to UTC date if anything goes wrong
-        schedule_today_jobs_for_date(datetime.utcnow())
+        try:
+            schedule_today_jobs_for_date(datetime.utcnow())
+        except Exception as e2:
+            logger.exception(f'Fallback scheduling also failed: {e2}')
 
+
+def scheduler_heartbeat():
+    """Periodic heartbeat check to verify scheduler is alive."""
+    global SCHEDULER_LAST_HEARTBEAT
+    SCHEDULER_LAST_HEARTBEAT = datetime.now(timezone.utc)
+    logger.debug(f"Scheduler heartbeat: {SCHEDULER_LAST_HEARTBEAT}")
+
+
+def check_scheduler_health() -> dict:
+    """Check if scheduler is running and responsive.
+    
+    Returns dict with 'healthy' (bool) and 'message' (str) keys.
+    """
+    global SCHEDULER, SCHEDULER_LAST_HEARTBEAT
+    
+    if SCHEDULER is None:
+        return {'healthy': False, 'message': 'Scheduler not initialized'}
+    
+    try:
+        # Check if scheduler is running
+        if not SCHEDULER.running:
+            return {'healthy': False, 'message': 'Scheduler not running'}
+        
+        # Check heartbeat freshness (should update every 5 min, allow 10 min grace)
+        if SCHEDULER_LAST_HEARTBEAT:
+            age_seconds = (datetime.now(timezone.utc) - SCHEDULER_LAST_HEARTBEAT).total_seconds()
+            if age_seconds > 600:  # 10 minutes
+                return {'healthy': False, 'message': f'Scheduler heartbeat stale ({int(age_seconds)}s old)'}
+        
+        return {'healthy': True, 'message': 'Scheduler healthy'}
+    except Exception as e:
+        logger.exception(f"Error checking scheduler health: {e}")
+        return {'healthy': False, 'message': f'Health check error: {e}'}
+
+
+def restart_scheduler():
+    """Attempt to restart a dead scheduler.
+    
+    Returns True if restart successful, False otherwise.
+    """
+    global SCHEDULER
+    
+    logger.warning("Attempting to restart scheduler...")
+    
+    try:
+        # Shutdown existing scheduler if it exists
+        if SCHEDULER:
+            try:
+                SCHEDULER.shutdown(wait=False)
+                logger.info("Existing scheduler shut down")
+            except Exception as e:
+                logger.warning(f"Error shutting down scheduler: {e}")
+        
+        # Reset scheduler reference
+        SCHEDULER = None
+        
+        # Reinitialize
+        init_scheduler()
+        
+        if SCHEDULER and SCHEDULER.running:
+            logger.info("Scheduler restarted successfully")
+            return True
+        else:
+            logger.error("Scheduler restart failed")
+            return False
+    except Exception as e:
+        logger.exception(f"Exception during scheduler restart: {e}")
+        return False
 
 
 def init_scheduler():
-    """Initialize APScheduler with a persistent jobstore and rescheduler jobs.
+    """Initialize APScheduler with MemoryJobStore and health monitoring.
 
     This function is safe to call multiple times; it will only start the
-    scheduler once per process.
+    scheduler once per process unless it needs to be restarted.
     """
-    global SCHEDULER
+    global SCHEDULER, SCHEDULER_LAST_HEARTBEAT
     if not APSCHEDULER_AVAILABLE:
-        logger.warning("APScheduler or SQLAlchemy not available; running without persistent scheduler.")
+        logger.warning("APScheduler not available; running without scheduler.")
         return
 
-    if SCHEDULER is not None:
-        logger.debug("Scheduler already initialized in this process; skipping init")
+    if SCHEDULER is not None and SCHEDULER.running:
+        logger.debug("Scheduler already initialized and running; skipping init")
         return
 
     try:
+        # Use MemoryJobStore to avoid SQLite lock contention issues
         jobstores = {
-            'default': SQLAlchemyJobStore(url=f'sqlite:///{JOBSTORE_PATH}')
+            'default': MemoryJobStore()
         }
         # Prefer local timezone when available so cron triggers and displayed
         # next-run times align with local expectations (Asia/Dubai fallback).
@@ -223,10 +302,11 @@ def init_scheduler():
 
         SCHEDULER = BackgroundScheduler(jobstores=jobstores, timezone=scheduler_tz)
         SCHEDULER.start()
-        logger.info(f"APScheduler started with jobstore: sqlite:///{JOBSTORE_PATH}")
+        SCHEDULER_LAST_HEARTBEAT = datetime.now(timezone.utc)
+        logger.info(f"APScheduler started with MemoryJobStore (timezone: {scheduler_tz})")
 
     except Exception as e:
-        logger.error(f"Failed to start APScheduler with SQLAlchemyJobStore: {e}")
+        logger.exception(f"Failed to start APScheduler: {e}")
         SCHEDULER = None
         return
 
@@ -306,7 +386,7 @@ def init_scheduler():
                 continue
 
             # skip if run_date already in the past
-            if run_date <= datetime.utcnow().replace(tzinfo=timezone.utc):
+            if run_date <= datetime.now(timezone.utc):
                 logger.debug(f"Skipping scheduling past prayer {prayer} at {run_date}")
                 continue
 
@@ -323,21 +403,10 @@ def init_scheduler():
             except Exception as e:
                 logger.error(f"Failed to schedule job {jid}: {e}")
 
-    # Add a daily rescheduler job at 00:15 UTC that will create jobs for the day
+    # Add a daily rescheduler job at 00:15 that will create jobs for the day
     try:
         if not SCHEDULER.get_job('rescheduler-daily'):
-            # Prefer to schedule daily at local 00:15 if tzlocal is available
-            try:
-                if TZLOCAL_AVAILABLE:
-                    tz = get_localzone()
-                else:
-                    tz = timezone.utc
-            except Exception:
-                tz = timezone.utc
-
-            # Use a textual module:function reference so the job can be persisted
-            # by SQLAlchemyJobStore. `schedule_today_jobs_wrapper` is defined at
-            # module level above.
+            # Use a textual module:function reference for MemoryJobStore compatibility
             try:
                 # Do NOT pass a per-job timezone here — rely on scheduler timezone
                 # so cron triggers are interpreted in the scheduler's zone.
@@ -349,6 +418,14 @@ def init_scheduler():
             logger.info('Daily rescheduler job already present')
     except Exception as e:
         logger.warning(f'Could not add rescheduler-daily job: {e}')
+    
+    # Add scheduler health heartbeat job (runs every 5 minutes)
+    try:
+        if not SCHEDULER.get_job('scheduler-heartbeat'):
+            SCHEDULER.add_job('server:scheduler_heartbeat', trigger='interval', minutes=5, id='scheduler-heartbeat')
+            logger.info("Scheduled scheduler heartbeat job (every 5 min)")
+    except Exception as e:
+        logger.warning(f'Could not add scheduler-heartbeat job: {e}')
 
     # If jobstore is empty (no azan jobs scheduled for today), run an immediate populate
     try:
@@ -357,9 +434,43 @@ def init_scheduler():
         if not has_azan:
             logger.info('Jobstore appears empty of azan jobs; scheduling today immediately')
             # Use module-level scheduler helper to ensure consistent behavior
-            schedule_today_jobs_for_date(datetime.utcnow())
+            schedule_today_jobs_for_date(datetime.now(timezone.utc))
     except Exception as e:
         logger.warning(f'Error checking existing jobs: {e}')
+
+
+@app.route('/api/health', methods=['GET'])
+def api_health():
+    """Main health endpoint - check overall system health including scheduler."""
+    try:
+        health = check_scheduler_health()
+        
+        response = {
+            'status': 'healthy' if health['healthy'] else 'unhealthy',
+            'scheduler': health,
+            'timestamp': datetime.now(timezone.utc).isoformat() + 'Z'
+        }
+        
+        # Add scheduler uptime if available
+        if SCHEDULER_LAST_HEARTBEAT:
+            response['scheduler']['last_heartbeat'] = SCHEDULER_LAST_HEARTBEAT.isoformat() + 'Z'
+            age_seconds = (datetime.now(timezone.utc) - SCHEDULER_LAST_HEARTBEAT).total_seconds()
+            response['scheduler']['heartbeat_age_seconds'] = int(age_seconds)
+        
+        # Add job counts
+        if SCHEDULER:
+            try:
+                jobs = SCHEDULER.get_jobs()
+                response['scheduler']['total_jobs'] = len(jobs)
+                response['scheduler']['azan_jobs'] = len([j for j in jobs if j.id.startswith('azan-')])
+            except Exception as e:
+                logger.warning(f"Could not get job counts: {e}")
+        
+        status_code = 200 if health['healthy'] else 503
+        return jsonify(response), status_code
+    except Exception as e:
+        logger.exception(f"Health check error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
 @app.route('/api/health/scheduler', methods=['GET'])
@@ -832,167 +943,126 @@ def play_audio():
 def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dict:
     """Internal in-process playback function used by scheduled jobs and `/api/play`.
 
-    Returns a dict with `status` and optional `message`. This mirrors the behavior
-    of the `/api/play` route but runs in-process (no HTTP).
+    Simplified recovery logic with better error handling and partial-success support.
+    Returns a dict with `status` and optional `message`.
     """
     global PLAYBACK_ACTIVE
+    
+    # Generate correlation ID for tracking this playback attempt across logs
+    import uuid
+    correlation_id = str(uuid.uuid4())[:8]
+    
     try:
-        logger.info(f"play_from_job invoked: file={filename} prayer={prayer} force={force}")
+        logger.info(f"[{correlation_id}] play_from_job START: file={filename} prayer={prayer} force={force}")
 
         if prayer and not force and has_played_today(prayer):
-            logger.info(f"Skipping play_from_job for {prayer}: already played today")
+            logger.info(f"[{correlation_id}] Skipping: {prayer} already played today")
             return {"status": "skipped", "message": "prayer already played today"}
 
-
-        speakers = get_sonos_speakers()
+        # Single discovery per playback attempt (eliminate race conditions)
+        speakers = get_sonos_speakers(timeout=5, max_retries=3)
         if not speakers:
-            return {"status": "error", "message": "No speakers"}
+            logger.error(f"[{correlation_id}] No speakers discovered")
+            return {"status": "error", "message": "No speakers found"}
 
-        # Always group all zones before playback so azan hits every room.
+        logger.info(f"[{correlation_id}] Discovered {len(speakers)} speaker(s)")
+
+        # Group all zones before playback with tracking
+        coordinator = None
+        successful_zones = []
+        failed_zones = []
+        
         try:
             from playback import group_zones
-            group_zones(speakers)
-            # re-discover to pick the active coordinator after grouping
-            speakers = get_sonos_speakers()
-        except Exception:
-            pass
+            coordinator_name = group_zones(speakers)
+            # After grouping, get the coordinator
+            for s in speakers:
+                try:
+                    if getattr(s, 'player_name', '') == coordinator_name:
+                        coordinator = s
+                        break
+                except Exception:
+                    continue
+            
+            # Track which zones successfully joined
+            if coordinator:
+                try:
+                    members = list(coordinator.group.members)
+                    successful_zones = [getattr(m, 'player_name', 'unknown') for m in members]
+                except Exception:
+                    successful_zones = [coordinator_name] if coordinator_name else []
+        except Exception as e:
+            logger.warning(f"[{correlation_id}] Grouping warning: {e}")
 
-        coordinator = choose_coordinator(speakers)
+        # Fallback: use first speaker as coordinator if grouping failed
         if not coordinator:
+            coordinator = choose_coordinator(speakers)
+            if coordinator:
+                successful_zones = [getattr(coordinator, 'player_name', 'unknown')]
+
+        if not coordinator:
+            logger.error(f"[{correlation_id}] No coordinator available")
             return {"status": "error", "message": "No coordinator"}
 
-        # Attempt to play; if the coordinator isn't properly the group coordinator
-        # Sonos may reject `play_uri`. Retry once after re-resolving the coordinator.
+        # Calculate failed zones
+        all_zone_names = [getattr(s, 'player_name', f'unknown-{i}') for i, s in enumerate(speakers)]
+        failed_zones = [z for z in all_zone_names if z not in successful_zones]
+        
+        total_zones = len(speakers)
+        success_count = len(successful_zones)
+        logger.info(f"[{correlation_id}] Grouped {success_count}/{total_zones} zones. Failed: {failed_zones}")
+
+        # Attempt to play with simple retry (no complex recovery)
         audio_url = build_audio_url(filename)
-        logger.info(f"Playing URL (in-process): {audio_url} on {getattr(coordinator, 'player_name', None)}")
+        logger.info(f"[{correlation_id}] Playing URL: {audio_url} on coordinator: {getattr(coordinator, 'player_name', 'unknown')}")
 
         played_success = False
         last_exc = None
 
-        # Initial attempts: try twice, re-resolving coordinator between attempts
         for attempt in (1, 2):
             try:
-                set_group_volume(coordinator, 90)
+                set_group_volume(coordinator, 35)
                 play_uri(coordinator, audio_url)
                 played_success = True
+                logger.info(f"[{correlation_id}] Playback started successfully (attempt {attempt})")
                 break
             except Exception as e:
                 last_exc = e
-                logger.warning(f"play_uri attempt {attempt} failed: {e}")
+                logger.warning(f"[{correlation_id}] Playback attempt {attempt} failed: {e}")
+                
+                # Simple retry: rediscover coordinator
                 if attempt == 1:
+                    time.sleep(2)
                     try:
-                        time.sleep(1.0)
-                    except Exception:
-                        pass
-                    speakers = get_sonos_speakers()
-                    coordinator = choose_coordinator(speakers) or coordinator
-                    logger.info(f"Re-resolved coordinator to: {getattr(coordinator, 'player_name', None)}")
-                    continue
-
-        # If initial retries failed, attempt robust recovery: unjoin & rejoin members then play
-        if not played_success:
-            try:
-                logger.info("Attempting unjoin/rejoin recovery for Sonos group")
-                speakers = get_sonos_speakers()
-                if speakers:
-                    coordinator = choose_coordinator(speakers) or coordinator
-
-                    # Try to unjoin members from the coordinator first
-                    try:
-                        members = list(getattr(coordinator, 'group').members)
-                    except Exception:
-                        members = []
-
-                    for m in members:
-                        if m == coordinator:
-                            continue
-                        try:
-                            m.unjoin()
-                        except Exception:
-                            pass
-
-                    # Small pause to let unjoin take effect
-                    try:
-                        time.sleep(1.0)
-                    except Exception:
-                        pass
-
-                    # Re-join members to the coordinator
-                    for s in speakers:
-                        try:
-                            if s == coordinator:
-                                continue
-                            s.join(coordinator)
-                        except Exception:
-                            pass
-
-                    # Allow group to stabilize
-                    try:
-                        time.sleep(1.5)
-                    except Exception:
-                        pass
-
-                    # Final attempt to play
-                    try:
-                        set_group_volume(coordinator, 90)
-                        play_uri(coordinator, audio_url)
-                        played_success = True
-                        logger.info("Playback started after recovery")
-                    except Exception as e:
-                        last_exc = e
-                        logger.error(f"Playback failed after recovery: {e}")
-                else:
-                    logger.error("No speakers found during recovery attempt")
-            except Exception as e:
-                last_exc = e
-                logger.error(f"Recovery attempt error: {e}")
+                        import soco
+                        refreshed_speakers = list(soco.discover(timeout=3) or [])
+                        if refreshed_speakers:
+                            coordinator = choose_coordinator(refreshed_speakers) or coordinator
+                            logger.info(f"[{correlation_id}] Retrying with refreshed coordinator: {getattr(coordinator, 'player_name', 'unknown')}")
+                    except Exception as refresh_err:
+                        logger.warning(f"[{correlation_id}] Could not refresh coordinator: {refresh_err}")
 
         if not played_success:
-            # All attempts failed
             msg = str(last_exc) if last_exc else 'unknown error'
+            logger.error(f"[{correlation_id}] Playback FAILED after all attempts: {msg}")
             return {"status": "error", "message": msg}
 
-        # mark played for dedupe tracking if `prayer` provided
-        try:
-            if prayer:
-                mark_played(prayer, {"file": filename})
-        except Exception as e:
-            logger.warning(f"Failed to mark played: {e}")
+        # Mark played for dedupe tracking if `prayer` provided
+        if prayer:
+            try:
+                mark_played(prayer, {"file": filename, "correlation_id": correlation_id})
+            except Exception as e:
+                logger.warning(f"[{correlation_id}] Failed to mark played: {e}")
 
+        # Start monitor to restore state after playback
         start_monitor(coordinator)
 
-        return {"status": "success"}
+        logger.info(f"[{correlation_id}] Play SUCCESS - {success_count}/{total_zones} zones")
+        return {"status": "success", "zones_played": success_count, "zones_total": total_zones}
 
     except Exception as e:
-        logger.error(f"play_from_job error: {e}")
+        logger.exception(f"[{correlation_id}] Unexpected error in play_from_job: {e}")
         return {"status": "error", "message": str(e)}
-
-
-    # ------------------------------------------------------------------
-    # Test job function (module-level so SQLAlchemyJobStore can persist by reference)
-    # ------------------------------------------------------------------
-    def test_job_func(job_id=None, note=None):
-        """A simple importable function that can be scheduled and persisted.
-        It logs invocation and appends a record to the play history for visibility.
-        """
-        logger.info(f"Test job executed: {job_id} note={note}")
-        # Append a small marker to play_history for audit (non-critical)
-        try:
-            entry = {"file": "test-job", "ts": datetime.utcnow().isoformat() + 'Z', "job_id": job_id, "note": note}
-            if os.path.exists(PLAY_HISTORY_FILE):
-                with open(PLAY_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    hist = json.load(f)
-            else:
-                hist = []
-        except Exception:
-            hist = []
-
-        hist.append(entry)
-        try:
-            with open(PLAY_HISTORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(hist, f)
-        except Exception as e:
-            logger.warning(f"Could not write play history from test job: {e}")
 
 
 if __name__ == '__main__':
@@ -1000,9 +1070,9 @@ if __name__ == '__main__':
     init_scheduler()
     logger.info("Server Starting on Port 5000...")
     app.run(host='0.0.0.0', port=5000)
-
-# Ensure scheduler initialized when module is imported (useful for gunicorn --preload)
-try:
-    init_scheduler()
-except Exception as e:
-    logger.exception(f"init_scheduler() on import failed: {e}")
+else:
+    # For gunicorn/WSGI: Only initialize once when first imported
+    try:
+        init_scheduler()
+    except Exception as e:
+        logger.exception(f"init_scheduler() on import failed: {e}")
