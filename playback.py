@@ -94,7 +94,7 @@ def build_audio_url(filename: str, port: int = 5000) -> str:
     return f"http://{ip}:{port}/audio/{filename}"
 
 
-def set_group_volume(coordinator, volume: int = 35):
+def set_group_volume(coordinator, volume: int = 75):
     try:
         coordinator.group.volume = volume
     except Exception:
@@ -229,6 +229,12 @@ def group_zones(speakers: List) -> Optional[str]:
     """Group all speakers onto the elected coordinator (first found).
 
     Returns the coordinator.player_name on success, or None if no speakers.
+    
+    Strategy to avoid UPnP 501 errors:
+    1. Ungrouping all speakers first (except coordinator) to clear existing groups
+    2. Wait for Sonos system to settle after ungrouping
+    3. Check if speakers are already in target group before joining
+    4. Join speakers with retry logic for transient failures
     """
     if not speakers:
         return None
@@ -238,11 +244,54 @@ def group_zones(speakers: List) -> Optional[str]:
         return None
 
     logger.info(f"Elected Coordinator: {coordinator.player_name}")
-    for s in speakers[1:]:
-        logger.info(f"Joining {s.player_name} to {coordinator.player_name}")
+    
+    # Step 1: Ungrouping all non-coordinator speakers to clear existing groups
+    logger.info("Ungrouping all speakers to clear existing groups...")
+    for s in speakers:
+        if s.player_name == coordinator.player_name:
+            continue
         try:
-            s.join(coordinator)
+            # Check if speaker is in a group (more than 1 member means grouped)
+            if len(s.group.members) > 1:
+                s.unjoin()
+                logger.info(f"Unjoined {s.player_name} from existing group")
+            else:
+                logger.debug(f"{s.player_name} already standalone")
         except Exception as e:
-            logger.warning(f"Failed to join {s.player_name}: {e}")
+            logger.warning(f"Failed to unjoin {s.player_name}: {e}")
+    
+    # Step 2: Brief pause to let Sonos system settle after ungrouping
+    # Sonos needs time to process group state changes
+    time.sleep(1.5)
+    
+    # Step 3: Join speakers to coordinator with group membership check and retry
+    for s in speakers:
+        if s.player_name == coordinator.player_name:
+            continue
+        
+        # Check if already in target group (skip if so)
+        try:
+            if coordinator in s.group.members:
+                logger.debug(f"{s.player_name} already in target group, skipping")
+                continue
+        except Exception:
+            pass
+        
+        logger.info(f"Joining {s.player_name} to {coordinator.player_name}")
+        
+        # Try joining with retry (up to 2 attempts for transient failures)
+        for attempt in range(2):
+            try:
+                s.join(coordinator)
+                logger.debug(f"Successfully joined {s.player_name} (attempt {attempt + 1})")
+                break
+            except Exception as e:
+                if attempt == 0:
+                    # First attempt failed, wait briefly and retry
+                    logger.debug(f"Join attempt 1 failed for {s.player_name}, retrying...")
+                    time.sleep(1)
+                else:
+                    # Final attempt failed, log warning
+                    logger.warning(f"Failed to join {s.player_name}: {e}")
 
     return coordinator.player_name

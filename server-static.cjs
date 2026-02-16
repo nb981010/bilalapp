@@ -60,6 +60,19 @@ const server = http.createServer((req, res) => {
   try {
     const parsed = url.parse(req.url || '/');
     let pathname = decodeURIComponent(parsed.pathname || '/');
+    
+    // Health check endpoint
+    if (pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        uptime: process.uptime(),
+        port: PORT,
+        timestamp: new Date().toISOString()
+      }));
+      return;
+    }
+    
     // Proxy API and audio requests to backend
     if (pathname.startsWith('/api') || pathname.startsWith('/audio')) {
       return proxyToBackend(req, res);

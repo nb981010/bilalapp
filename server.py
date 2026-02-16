@@ -25,7 +25,7 @@ except Exception:
 # Scheduler imports (lazy import in case deps not installed)
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
-    from apscheduler.jobstores.memory import MemoryJobStore
+    from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
     APSCHEDULER_AVAILABLE = True
 except Exception:
     APSCHEDULER_AVAILABLE = False
@@ -281,9 +281,10 @@ def init_scheduler():
         return
 
     try:
-        # Use MemoryJobStore to avoid SQLite lock contention issues
+        # Use SQLAlchemyJobStore to persist jobs across restarts
+        db_path = os.path.join(os.path.dirname(__file__), 'jobs.sqlite')
         jobstores = {
-            'default': MemoryJobStore()
+            'default': SQLAlchemyJobStore(url=f'sqlite:///{db_path}')
         }
         # Prefer local timezone when available so cron triggers and displayed
         # next-run times align with local expectations (Asia/Dubai fallback).
@@ -303,7 +304,7 @@ def init_scheduler():
         SCHEDULER = BackgroundScheduler(jobstores=jobstores, timezone=scheduler_tz)
         SCHEDULER.start()
         SCHEDULER_LAST_HEARTBEAT = datetime.now(timezone.utc)
-        logger.info(f"APScheduler started with MemoryJobStore (timezone: {scheduler_tz})")
+        logger.info(f"APScheduler started with SQLAlchemyJobStore at {db_path} (timezone: {scheduler_tz})")
 
     except Exception as e:
         logger.exception(f"Failed to start APScheduler: {e}")
@@ -443,11 +444,13 @@ def init_scheduler():
 def api_health():
     """Main health endpoint - check overall system health including scheduler."""
     try:
+        global _scheduler_initialized
         health = check_scheduler_health()
         
         response = {
             'status': 'healthy' if health['healthy'] else 'unhealthy',
             'scheduler': health,
+            'scheduler_initialized': _scheduler_initialized,
             'timestamp': datetime.now(timezone.utc).isoformat() + 'Z'
         }
         
@@ -1021,7 +1024,7 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
 
         for attempt in (1, 2):
             try:
-                set_group_volume(coordinator, 35)
+                set_group_volume(coordinator, 75)
                 play_uri(coordinator, audio_url)
                 played_success = True
                 logger.info(f"[{correlation_id}] Playback started successfully (attempt {attempt})")
@@ -1065,14 +1068,32 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
         return {"status": "error", "message": str(e)}
 
 
+# Global flag to track scheduler initialization
+_scheduler_init_lock = threading.Lock()
+_scheduler_initialized = False
+
+def _init_scheduler_background():
+    """Initialize scheduler in background thread to avoid blocking WSGI startup."""
+    global _scheduler_initialized
+    with _scheduler_init_lock:
+        if _scheduler_initialized:
+            logger.debug("Scheduler already initialized, skipping")
+            return
+        try:
+            logger.info("Starting scheduler initialization in background...")
+            init_scheduler()
+            _scheduler_initialized = True
+            logger.info("Scheduler initialization completed")
+        except Exception as e:
+            logger.exception(f"Scheduler initialization failed: {e}")
+
 if __name__ == '__main__':
     # When running as script, ensure scheduler initialized and run Flask dev server
     init_scheduler()
     logger.info("Server Starting on Port 5000...")
     app.run(host='0.0.0.0', port=5000)
 else:
-    # For gunicorn/WSGI: Only initialize once when first imported
-    try:
-        init_scheduler()
-    except Exception as e:
-        logger.exception(f"init_scheduler() on import failed: {e}")
+    # For gunicorn/WSGI: Initialize scheduler in background thread to avoid blocking worker startup
+    init_thread = threading.Thread(target=_init_scheduler_background, daemon=True, name="SchedulerInit")
+    init_thread.start()
+    logger.info("Scheduler initialization started in background thread")
