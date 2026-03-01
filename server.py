@@ -5,6 +5,7 @@ import logging
 from playback import get_local_ip, get_sonos_speakers, choose_coordinator, build_audio_url, set_group_volume, play_uri, start_monitor
 import json
 from datetime import datetime, timezone, timedelta
+import db as _db
 from flask import Flask, send_from_directory, jsonify, request
 from flask import abort
 import os
@@ -54,10 +55,10 @@ SCHEDULER_LAST_HEARTBEAT = None  # Track scheduler health
 # Default coordinates (Dubai) used when computing prayer times server-side
 DUBAI_COORDS = (25.2048, 55.2708)
 
-# played history marker (file-backed)
-PLAY_HISTORY_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'play_history.json')
-# persisted played markers to prevent duplicate plays within a day
-PLAYED_MARKERS_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'played_markers.json')
+# Legacy JSON paths — kept only for one-time migration on first startup.
+# All persistent state now lives in bilal.sqlite via db.py.
+_LEGACY_PLAY_HISTORY  = os.path.join(os.path.dirname(__file__), 'logs', 'play_history.json')
+_LEGACY_PLAYED_MARKERS = os.path.join(os.path.dirname(__file__), 'logs', 'played_markers.json')
 
 # ---------------------------------------------------------
 # Helpers
@@ -152,6 +153,11 @@ def schedule_today_jobs_for_date(target_date: datetime):
         try:
             SCHEDULER.add_job('persistent_jobs:test_job_func', trigger='date', run_date=run_date, id=jid, kwargs={'job_id': jid, 'note': prayer, 'file': file_name, 'prayer': prayer})
             logger.info(f"Scheduled Azan job {jid} -> {run_date}")
+            # Persist to prayer_schedule table for status reporting
+            try:
+                _db.upsert_prayer_schedule(date_str, prayer, run_date.isoformat().replace('+00:00', 'Z'), jid)
+            except Exception as _dbe:
+                logger.warning(f"db.upsert_prayer_schedule failed: {_dbe}")
         except Exception as e:
             logger.error(f"Failed to schedule job {jid}: {e}")
 
@@ -280,6 +286,15 @@ def init_scheduler():
         logger.debug("Scheduler already initialized and running; skipping init")
         return
 
+    # Initialise application DB and migrate any legacy JSON data once.
+    try:
+        _db.init_db()
+        migrated = _db.migrate_from_json(_LEGACY_PLAYED_MARKERS, _LEGACY_PLAY_HISTORY)
+        if any(migrated.values()):
+            logger.info(f"Migrated legacy JSON to SQLite: {migrated}")
+    except Exception as _dbe:
+        logger.warning(f"db.init_db/migrate failed: {_dbe}")
+
     try:
         # Use SQLAlchemyJobStore to persist jobs across restarts
         db_path = os.path.join(os.path.dirname(__file__), 'jobs.sqlite')
@@ -401,6 +416,11 @@ def init_scheduler():
                 file_name = 'fajr.mp3' if prayer and prayer.lower() == 'fajr' else 'azan.mp3'
                 SCHEDULER.add_job('persistent_jobs:test_job_func', trigger='date', run_date=run_date, id=jid, kwargs={'job_id': jid, 'note': prayer, 'file': file_name, 'prayer': prayer})
                 logger.info(f"Scheduled Azan job {jid} -> {run_date}")
+                # Persist to prayer_schedule table for status reporting
+                try:
+                    _db.upsert_prayer_schedule(date_str, prayer, run_date.isoformat().replace('+00:00', 'Z'), jid)
+                except Exception as _dbe:
+                    logger.warning(f"db.upsert_prayer_schedule failed: {_dbe}")
             except Exception as e:
                 logger.error(f"Failed to schedule job {jid}: {e}")
 
@@ -438,6 +458,29 @@ def init_scheduler():
             schedule_today_jobs_for_date(datetime.now(timezone.utc))
     except Exception as e:
         logger.warning(f'Error checking existing jobs: {e}')
+
+    # Backfill prayer_schedule from any pre-existing APScheduler azan jobs so
+    # bilal.sqlite is always in sync even across restarts.
+    try:
+        backfilled = 0
+        for j in SCHEDULER.get_jobs():
+            if not j.id.startswith('azan-'):
+                continue
+            # id format: azan-YYYY-MM-DD-prayer
+            parts = j.id.split('-', 4)  # ['azan', 'YYYY', 'MM', 'DD', 'prayer']
+            if len(parts) != 5:
+                continue
+            date_str = f"{parts[1]}-{parts[2]}-{parts[3]}"
+            prayer = parts[4]
+            nrt = getattr(j, 'next_run_time', None)
+            if nrt:
+                utc_str = nrt.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+                _db.upsert_prayer_schedule(date_str, prayer, utc_str, j.id)
+                backfilled += 1
+        if backfilled:
+            logger.info(f"Backfilled {backfilled} azan job(s) into prayer_schedule")
+    except Exception as e:
+        logger.warning(f'prayer_schedule backfill failed: {e}')
 
 
 @app.route('/api/health', methods=['GET'])
@@ -521,54 +564,14 @@ def api_health_scheduler():
 
 
 
-def _load_played_markers():
-    try:
-        if os.path.exists(PLAYED_MARKERS_FILE):
-            with open(PLAYED_MARKERS_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return []
-
-
-def _save_played_markers(markers):
-    try:
-        with open(PLAYED_MARKERS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(markers, f)
-    except Exception as e:
-        logger.warning(f"Could not save played markers: {e}")
-
-
 def has_played_today(prayer: str) -> bool:
     """Return True if `prayer` has been recorded as played for today's date."""
-    if not prayer:
-        return False
-    today = datetime.utcnow().date().isoformat()
-    markers = _load_played_markers()
-    for m in markers:
-        if m.get('date') == today and m.get('prayer') == prayer:
-            return True
-    return False
+    return _db.has_played_today(prayer)
 
 
 def mark_played(prayer: str, details: dict = None):
     """Record that `prayer` was played today. `details` may include extra metadata."""
-    if not prayer:
-        return
-    today = datetime.utcnow().date().isoformat()
-    markers = _load_played_markers()
-    entry = {'date': today, 'prayer': prayer, 'ts': datetime.utcnow().isoformat() + 'Z'}
-    if details and isinstance(details, dict):
-        entry.update(details)
-    markers.append(entry)
-    # Keep markers trimmed to last 30 days to avoid unbounded growth
-    try:
-        # filter out older than 30 days
-        cutoff = (datetime.utcnow() - timedelta(days=30)).date().isoformat()
-        markers = [m for m in markers if m.get('date', '') >= cutoff]
-    except Exception:
-        pass
-    _save_played_markers(markers)
+    _db.mark_played(prayer, details)
 
 # ---------------------------------------------------------
 # Routes
@@ -731,19 +734,13 @@ def api_scheduler_simulate_play():
         if not payload or 'file' not in payload or 'ts' not in payload:
             return jsonify({"status": "error", "message": "file and ts required"}), 400
 
-        # Append to play_history.json
-        try:
-            if os.path.exists(PLAY_HISTORY_FILE):
-                with open(PLAY_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    hist = json.load(f)
-            else:
-                hist = []
-        except Exception:
-            hist = []
-
-        hist.append({"file": payload['file'], "ts": payload['ts']})
-        with open(PLAY_HISTORY_FILE, 'w', encoding='utf-8') as f:
-            json.dump(hist, f)
+        # Record simulated play in SQLite play_history
+        _db.record_play(
+            file=payload['file'],
+            ts=payload['ts'],
+            status='simulated',
+            message='simulate-play endpoint',
+        )
 
         logger.info(f"Simulated play appended: {payload}")
         return jsonify({"status": "success"})
@@ -814,8 +811,8 @@ def api_scheduler_create_test_job():
 
 @app.route('/api/scheduler/played', methods=['GET'])
 def api_scheduler_played():
-    """Return played markers for today (and optional query `days` to include prior days).
-    Example: `/api/scheduler/played?days=3` returns last 3 days of markers.
+    """Return played markers for today (optional ?days=N for prior days).
+    Also returns play_history for the same window.
     """
     try:
         days_q = request.args.get('days', '1')
@@ -823,20 +820,44 @@ def api_scheduler_played():
             days = int(days_q)
         except Exception:
             days = 1
-
-        markers = _load_played_markers()
-        if days <= 1:
-            today = datetime.utcnow().date().isoformat()
-            todays = [m for m in markers if m.get('date') == today]
-            return jsonify({"markers": todays})
-
-        # include last `days` days
-        cutoff = (datetime.utcnow() - timedelta(days=days-1)).date().isoformat()
-        results = [m for m in markers if m.get('date', '') >= cutoff]
-        return jsonify({"markers": results})
+        markers = _db.get_played_markers(days=days)
+        history = _db.get_play_history(days=days)
+        return jsonify({"markers": markers, "history": history})
     except Exception as e:
         logger.error(f"played endpoint error: {e}")
-        return jsonify({"markers": []}), 500
+        return jsonify({"markers": [], "history": []}), 500
+
+
+@app.route('/api/history', methods=['GET'])
+def api_history():
+    """Return play_history from SQLite. Optional ?days=N (default 7)."""
+    try:
+        days = int(request.args.get('days', '7'))
+    except Exception:
+        days = 7
+    try:
+        return jsonify({"history": _db.get_play_history(days=days)})
+    except Exception as e:
+        logger.error(f"history endpoint error: {e}")
+        return jsonify({"history": []}), 500
+
+
+@app.route('/api/schedule', methods=['GET'])
+def api_schedule():
+    """Return prayer_schedule rows from SQLite. Optional ?days=N (default 2)."""
+    try:
+        days = int(request.args.get('days', '2'))
+    except Exception:
+        days = 2
+    try:
+        from datetime import date as _date
+        today = datetime.now(timezone.utc).date()
+        start = (today - timedelta(days=days - 1)).isoformat()
+        end = today.isoformat()
+        return jsonify({"schedule": _db.get_prayer_schedule_range(start, end)})
+    except Exception as e:
+        logger.error(f"schedule endpoint error: {e}")
+        return jsonify({"schedule": []}), 500
 
 
 @app.route('/api/scheduler/repopulate_today', methods=['POST'])
@@ -966,6 +987,8 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
         speakers = get_sonos_speakers(timeout=5, max_retries=3)
         if not speakers:
             logger.error(f"[{correlation_id}] No speakers discovered")
+            _db.record_play(prayer=prayer, file=filename, status='no_speakers',
+                            correlation_id=correlation_id, message='No speakers found')
             return {"status": "error", "message": "No speakers found"}
 
         logger.info(f"[{correlation_id}] Discovered {len(speakers)} speaker(s)")
@@ -1048,6 +1071,9 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
         if not played_success:
             msg = str(last_exc) if last_exc else 'unknown error'
             logger.error(f"[{correlation_id}] Playback FAILED after all attempts: {msg}")
+            _db.record_play(prayer=prayer, file=filename, status='error',
+                            zones_played=0, zones_total=total_zones,
+                            correlation_id=correlation_id, message=msg)
             return {"status": "error", "message": msg}
 
         # Mark played for dedupe tracking if `prayer` provided
@@ -1059,6 +1085,11 @@ def play_from_job(filename: str, prayer: str = None, force: bool = False) -> dic
 
         # Start monitor to restore state after playback
         start_monitor(coordinator)
+
+        # Persist play result to SQLite
+        _db.record_play(prayer=prayer, file=filename, status='success',
+                        zones_played=success_count, zones_total=total_zones,
+                        correlation_id=correlation_id)
 
         logger.info(f"[{correlation_id}] Play SUCCESS - {success_count}/{total_zones} zones")
         return {"status": "success", "zones_played": success_count, "zones_total": total_zones}
@@ -1088,12 +1119,20 @@ def _init_scheduler_background():
             logger.exception(f"Scheduler initialization failed: {e}")
 
 if __name__ == '__main__':
-    # When running as script, ensure scheduler initialized and run Flask dev server
+    # Running directly as a script: initialise scheduler inline then serve.
     init_scheduler()
     logger.info("Server Starting on Port 5000...")
     app.run(host='0.0.0.0', port=5000)
 else:
-    # For gunicorn/WSGI: Initialize scheduler in background thread to avoid blocking worker startup
-    init_thread = threading.Thread(target=_init_scheduler_background, daemon=True, name="SchedulerInit")
-    init_thread.start()
-    logger.info("Scheduler initialization started in background thread")
+    # When served by gunicorn with preload_app=True (see gunicorn.conf.py) the
+    # app module is loaded once in the arbiter *before* forking workers.
+    # Threads do NOT survive a fork, so starting the scheduler here would leave
+    # a dead scheduler in every worker.  gunicorn.conf.py's post_fork hook
+    # resets the globals and calls _init_scheduler_background() after the fork.
+    #
+    # For non-gunicorn WSGI servers that don't preload (e.g. bare uWSGI),
+    # uncomment the three lines below:
+    # init_thread = threading.Thread(target=_init_scheduler_background, daemon=True, name="SchedulerInit")
+    # init_thread.start()
+    # logger.info("Scheduler initialization started in background thread")
+    pass

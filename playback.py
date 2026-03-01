@@ -34,7 +34,12 @@ def get_local_ip() -> str:
 
 def get_sonos_speakers(timeout: int = 5, max_retries: int = 3) -> List:
     """Discover Sonos speakers using SoCo with retry logic.
-    
+
+    If the environment variable ``SONOS_HOST`` is set (e.g. "192.168.2.50")
+    multicast discovery is skipped and a direct SoCo connection to that IP is
+    returned.  Useful when the server is on a different subnet or multicast is
+    blocked.
+
     Retries with exponential backoff on network errors.
     Returns empty list only after all retries exhausted.
     """
@@ -43,6 +48,17 @@ def get_sonos_speakers(timeout: int = 5, max_retries: int = 3) -> List:
     except ImportError:
         logger.error("SoCo library not found.")
         return []
+
+    # Direct-IP bypass: skip multicast when SONOS_HOST env var is set.
+    sonos_host = os.environ.get('SONOS_HOST', '').strip()
+    if sonos_host:
+        try:
+            speaker = soco.SoCo(sonos_host)
+            _ = speaker.player_name  # validate reachability
+            logger.info(f"SONOS_HOST set: direct connection to {sonos_host} ({speaker.player_name})")
+            return [speaker]
+        except Exception as e:
+            logger.warning(f"SONOS_HOST={sonos_host} unreachable ({e}); falling back to multicast discovery")
     
     retry_delays = [0, 2, 5]  # seconds between retries
     

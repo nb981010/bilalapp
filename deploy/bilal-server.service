@@ -9,12 +9,12 @@ WorkingDirectory=/home/nbc/bilalapp
 Environment=PYTHONUNBUFFERED=1
 Environment=TESTING_TOKEN=ryhaYpDKnmffQ2NXXdPMOeerEiV7CybV
 # Single worker to avoid multiple schedulers
-ExecStart=/home/nbc/bilalapp/.venv/bin/gunicorn --workers 1 --bind 0.0.0.0:5000 --timeout 120 server:app
+ExecStart=/home/nbc/bilalapp/venv/bin/gunicorn --config /home/nbc/bilalapp/gunicorn.conf.py server:app
 Restart=always
 RestartSec=10
-# Prevent crash loops: max 5 restarts in 10 minutes
-StartLimitBurst=5
-StartLimitIntervalSec=600
+# Allow up to 10 restarts in 30 minutes before systemd gives up
+StartLimitBurst=10
+StartLimitIntervalSec=1800
 StandardOutput=journal
 StandardError=journal
 # Set resource limits for Raspberry Pi

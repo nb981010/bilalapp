@@ -1,41 +1,34 @@
 import os, json
 from datetime import datetime
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+import db as _db
 
-LOG_DIR = os.path.join(os.path.dirname(__file__), 'logs')
-PLAY_HISTORY_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'play_history.json')
+LEGACY_PLAY_HISTORY_FILE = os.path.join(os.path.dirname(__file__), 'logs', 'play_history.json')
 
 
 def test_job_func(job_id=None, note=None, **kwargs):
     """A small test job function that is importable as `persistent_jobs:test_job_func`.
-    It appends a marker to `logs/play_history.json` so we can audit execution.
+    Calls server.play_from_job in-process; records execution to SQLite via db.py.
     """
-    # Try to call the local playback API so the server's dedupe guard is exercised.
     file = kwargs.get('file') or note or 'azan.mp3'
     prayer = kwargs.get('prayer') or note or job_id
-    # Call server.play_from_job in-process so the dedupe guard and playback
-    # logic are exercised without HTTP loopback.
     try:
         import server
-        # Call the in-process playback wrapper; ignore return value but log it
         res = server.play_from_job(file, prayer=prayer, force=False)
+        # play_from_job already calls _db.record_play internally; nothing more to do.
         return True
     except Exception:
-        # Fallback: record to play history if in-process call fails
+        # Fallback: record a bare entry so the job run is not completely invisible.
         try:
-            entry = {"file": "persistent-test-job", "ts": datetime.utcnow().isoformat() + 'Z', "job_id": job_id, "note": note}
-            if os.path.exists(PLAY_HISTORY_FILE):
-                with open(PLAY_HISTORY_FILE, 'r', encoding='utf-8') as f:
-                    hist = json.load(f)
-            else:
-                hist = []
-        except Exception:
-            hist = []
-
-        hist.append(entry)
-        try:
-            with open(PLAY_HISTORY_FILE, 'w', encoding='utf-8') as f:
-                json.dump(hist, f)
+            _db.init_db()
+            _db.record_play(
+                prayer=str(prayer),
+                file=str(file),
+                status='error',
+                job_id=str(job_id),
+                message='persistent_jobs fallback: server.play_from_job unavailable',
+            )
         except Exception:
             pass
-
     return True

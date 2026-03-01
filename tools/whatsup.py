@@ -1,24 +1,73 @@
 #!/usr/bin/env python3
-"""Print today's Azan schedule status by reading the APScheduler DB and logs.
+"""Print today's Azan schedule status by reading the APScheduler DB, bilal.sqlite and logs.
 
 Usage: python scripts/whatsup.py
 
-Looks for jobs in `apscheduler_jobs.sqlite` with ids like
-`azan_job_YYYY-MM-DD_<prayer>_play` and extracts scheduled times.
-Then scans `logs/out.log` and `logs/sys.log` to find start/end log timestamps
-for each prayer and prints a compact table.
+For status reporting it preferentially reads from bilal.sqlite (prayer_schedule,
+played_markers, play_history tables).  Falls back to APScheduler DB + log parsing
+when bilal.sqlite is not yet populated.
 """
 from __future__ import annotations
 import os
 import re
 import sqlite3
-from datetime import datetime, timezone, timedelta
-import json
 import sys
 import argparse
+from datetime import datetime, timezone, timedelta
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 RE_LOG_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+) - .* - (?:INFO|WARNING|ERROR) - (.*)$")
+
+
+def read_bilal_schedule(bilal_db: str, date_str: str) -> dict:
+    """Read prayer scheduled times from bilal.sqlite prayer_schedule table.
+    Returns {prayer: datetime_utc}.
+    """
+    if not os.path.exists(bilal_db):
+        return {}
+    try:
+        conn = sqlite3.connect(bilal_db)
+        rows = conn.execute(
+            "SELECT prayer, scheduled_utc FROM prayer_schedule WHERE date = ?",
+            (date_str,)
+        ).fetchall()
+        conn.close()
+        jobs = {}
+        for prayer, utc_str in rows:
+            try:
+                dt = datetime.fromisoformat(utc_str.replace('Z', '+00:00'))
+                jobs[prayer] = dt
+            except Exception:
+                pass
+        return jobs
+    except Exception:
+        return {}
+
+
+def read_bilal_outcomes(bilal_db: str, date_str: str) -> dict:
+    """Read play outcomes from bilal.sqlite play_history for a given date.
+    Returns {prayer: {'status': ..., 'ts': ..., 'message': ...}}.
+    """
+    if not os.path.exists(bilal_db):
+        return {}
+    try:
+        conn = sqlite3.connect(bilal_db)
+        rows = conn.execute(
+            "SELECT prayer, ts, status, zones_played, zones_total, message "
+            "FROM play_history WHERE date(ts) = ? ORDER BY ts ASC",
+            (date_str,)
+        ).fetchall()
+        conn.close()
+        out = {}
+        for prayer, ts, status, zp, zt, msg in rows:
+            if prayer:
+                out[prayer.lower()] = {'status': status, 'ts': ts,
+                                       'zones_played': zp, 'zones_total': zt,
+                                       'message': msg}
+        return out
+    except Exception:
+        return {}
 
 
 def read_db_jobs(db_path: str, date_str: str):
@@ -79,18 +128,38 @@ def find_events_for_prayer(lines, prayer, scheduled_dt=None):
     else:
         target_date = datetime.now().date()
 
-    # prefer exact match with prayer in message, but only on target_date
+    # Primary match: play_from_job START log from server.py, e.g.
+    #   "[abc12345] play_from_job START: file=azan.mp3 prayer=asr force=False"
+    # Also match legacy "play job for" patterns.
     for ts, msg, raw in lines:
         if ts is None:
             continue
         if target_date and ts.date() != target_date:
             continue
         low = msg.lower()
-        if f"play job for {prayer}" in low or f"play job for '{prayer}'" in low:
+        if (
+            ('play_from_job start' in low and f'prayer={prayer}' in low)
+            or f'play job for {prayer}' in low
+            or f"play job for '{prayer}'" in low
+        ):
             start = ts
             break
 
-    # fallback: find 'Starting playback' within +- 10 minutes of scheduled_dt on same date
+    # Fallback 1: APScheduler "Running job" for the matching azan job id.
+    if start is None and target_date is not None:
+        date_str = target_date.isoformat()
+        window = timedelta(minutes=10)
+        for ts, msg, raw in lines:
+            if ts is None:
+                continue
+            if ts.date() != target_date:
+                continue
+            low = msg.lower()
+            if 'running job' in low and f'azan-{date_str}-{prayer}' in low:
+                start = ts
+                break
+
+    # Fallback 2: legacy 'starting playback' within +-10 min of scheduled time.
     if start is None and scheduled_dt is not None:
         window = timedelta(minutes=10)
         for ts, msg, raw in lines:
@@ -104,7 +173,9 @@ def find_events_for_prayer(lines, prayer, scheduled_dt=None):
                     start = ts
                     break
 
-    # find end: first 'Playback finished' after start on same date
+    # Find end: first success/failure log after start on the same date.
+    # Covers server.py: 'play success', 'playback failed', 'no speakers discovered'
+    # and legacy: 'playback finished', 'playback stopped'.
     if start is not None:
         for ts, msg, raw in lines:
             if ts is None:
@@ -114,7 +185,13 @@ def find_events_for_prayer(lines, prayer, scheduled_dt=None):
             if target_date and ts.date() != target_date:
                 continue
             low = msg.lower()
-            if 'playback finished' in low or 'playback stopped' in low:
+            if (
+                'play success' in low
+                or 'playback failed' in low
+                or 'no speakers discovered' in low
+                or 'playback finished' in low
+                or 'playback stopped' in low
+            ):
                 end = ts
                 break
 
@@ -138,66 +215,88 @@ def main():
     args = parser.parse_args()
 
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-
-    # APScheduler jobstore is persisted to jobs.sqlite (not apscheduler_jobs.sqlite).
-    # Keep a compatibility fallback to apscheduler_jobs.sqlite if it exists.
-    default_db = os.path.join(repo_root, 'jobs.sqlite')
+    bilal_db  = os.path.join(repo_root, 'bilal.sqlite')      # application DB (new)
+    aps_db    = os.path.join(repo_root, 'jobs.sqlite')        # APScheduler DB (fallback)
     legacy_db = os.path.join(repo_root, 'apscheduler_jobs.sqlite')
-    if os.path.exists(default_db):
-        db_path = os.path.abspath(default_db)
-    elif os.path.exists(legacy_db):
-        db_path = os.path.abspath(legacy_db)
-    else:
-        db_path = os.path.abspath(default_db)
 
-    # read logs once
-    log_paths = [os.path.join(repo_root, 'logs', 'out.log'), os.path.join(repo_root, 'logs', 'sys.log')]
+    # read logs once (used as fallback when bilal.sqlite has no data yet)
+    log_paths = [os.path.join(repo_root, 'logs', 'out.log'),
+                 os.path.join(repo_root, 'logs', 'sys.log')]
     lines = read_logs(log_paths)
 
     prayers = ['fajr', 'dhuhr', 'asr', 'maghrib', 'isha']
 
-    # Print header
-    print("Date\tPrayer\tStart (log)\tEnd (log)\tDuration\tStatus")
+    print("Date\tPrayer\tScheduled (UTC)\tPlayed (UTC)\tStatus\tZones\tDetails")
 
     today = datetime.now().date()
     for delta_days in range(0, args.days):
         target_date = today - timedelta(days=delta_days)
         date_str = target_date.isoformat()
 
-        # read persisted play jobs for the date
-        try:
-            jobs = read_db_jobs(db_path, date_str)
-        except FileNotFoundError:
-            # No DB available; fall back to log-only detection
-            jobs = {}
-            if delta_days == 0:
-                # only print notice once (for today)
-                print(f"apscheduler DB not found at {db_path}; falling back to logs")
+        # --- Scheduled times: prefer bilal.sqlite, fall back to APScheduler DB ---
+        schedule = read_bilal_schedule(bilal_db, date_str)
+        if not schedule:
+            # Fall back to APScheduler job store
+            aps_path = aps_db if os.path.exists(aps_db) else (legacy_db if os.path.exists(legacy_db) else None)
+            if aps_path:
+                try:
+                    raw_jobs = read_db_jobs(aps_path, date_str)
+                    for p, epoch in raw_jobs.items():
+                        if epoch:
+                            schedule[p] = datetime.fromtimestamp(epoch, tz=timezone.utc)
+                except Exception:
+                    pass
+
+        # --- Outcomes: prefer bilal.sqlite play_history ---
+        outcomes = read_bilal_outcomes(bilal_db, date_str)
 
         for p in prayers:
-            scheduled_epoch = jobs.get(p)
-            scheduled_dt = None
-            if scheduled_epoch:
+            scheduled_dt = schedule.get(p)
+            scheduled_s = scheduled_dt.strftime('%H:%M:%S') if scheduled_dt else ''
+
+            outcome = outcomes.get(p)
+            if outcome:
+                status_raw  = outcome.get('status') or 'unknown'
+                ts_str      = outcome.get('ts') or ''
+                zones_p     = outcome.get('zones_played')
+                zones_t     = outcome.get('zones_total')
+                msg         = outcome.get('message') or ''
+
+                # Parse played timestamp
+                played_s = ''
                 try:
-                    scheduled_dt = datetime.fromtimestamp(scheduled_epoch)
+                    played_dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    played_s  = played_dt.strftime('%H:%M:%S')
                 except Exception:
-                    scheduled_dt = None
+                    played_s = ts_str[:19] if ts_str else ''
 
-            start, end = find_events_for_prayer(lines, p, scheduled_dt)
-            if start and end:
-                duration = end - start
-                status = 'Success'
-            elif start and not end:
-                duration = None
-                status = 'Started'
+                zones_s = f"{zones_p}/{zones_t}" if zones_p is not None else ''
+
+                if status_raw == 'success':
+                    status_label = 'Success'
+                elif status_raw == 'no_speakers':
+                    status_label = 'Failure (no speakers)'
+                elif status_raw == 'error':
+                    status_label = f'Failure ({msg[:40]})' if msg else 'Failure'
+                elif status_raw == 'skipped':
+                    status_label = 'Skipped (already played)'
+                else:
+                    status_label = status_raw
+
+                print(f"{date_str}\t{p.capitalize()}\t{scheduled_s}\t{played_s}\t{status_label}\t{zones_s}\t{msg[:60]}")
             else:
-                duration = None
-                status = 'Failure'
-
-            start_s = start.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if start else ''
-            end_s = end.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] if end else ''
-            dur_s = format_duration(duration)
-            print(f"{date_str}\t{p.capitalize()}\t{start_s}\t{end_s}\t{dur_s}\t{status}")
+                # Fall back to log-based detection
+                start, end = find_events_for_prayer(lines, p, scheduled_dt)
+                if start and end:
+                    status_label = 'Success (log)'
+                    played_s = start.strftime('%H:%M:%S')
+                elif start:
+                    status_label = 'Started (log)'
+                    played_s = start.strftime('%H:%M:%S')
+                else:
+                    status_label = 'Failure' if scheduled_dt and scheduled_dt < datetime.now(timezone.utc) else 'Pending'
+                    played_s = ''
+                print(f"{date_str}\t{p.capitalize()}\t{scheduled_s}\t{played_s}\t{status_label}\t\t")
 
 
 if __name__ == '__main__':
